@@ -1,4 +1,60 @@
-# Atrium Marketplace — Internal Audit (v1.0.0-rc1)
+# Atrium Marketplace — Internal Audit (v1.1.0-rc1)
+
+## V1.1.0 — Crystal tier ladder ("Alt D")
+
+Replaces V1.0's binary 0% / 1.5% Crystal-holder check with a 5-rung ladder
+based on the buyer's HIGHEST owned Crystal tier:
+
+| Tier      | Fee bps | Effective rate |
+|-----------|---------|----------------|
+| Cosmic    | 0       | 0.00% (free)   |
+| Prismatic | 25      | 0.25%          |
+| Radiant   | 50      | 0.50%          |
+| Charged   | 100     | 1.00%          |
+| Raw       | fee_bps | 1.50% (default) |
+| No Crystal | fee_bps | 1.50% (default) |
+
+**New components:**
+- `MigrateMsg {}` + `migrate(deps, env, _msg)` entry-point
+- `highest_crystal_tier(deps, buyer)` — walks up to TIER_QUERY_LIMIT (30)
+  Crystals owned by buyer, returns highest tier across ALTAR → FUSION → MINT
+  resolution chain. Cosmic short-circuits.
+- `resolve_tier(deps, altar, fusion, mint, token_id)` — per-token tier lookup,
+  swallows individual contract errors and returns None.
+- Hardcoded mainnet addresses for ALTAR/FUSION/MINT (zero migration surface,
+  no admin-mis-set risk).
+
+**Gas analysis:**
+- Buyer with 0 Crystals: 1 query (cw721 Tokens) → ~25K extra gas
+- Buyer with N≤30 non-Cosmic Crystals: 1 + 3N queries → up to ~2.3M extra gas
+- Buyer with Cosmic at any position ≤30: short-circuits → ~50K-2.3M depending on position
+- Whale (>30 Crystals) edge case: only first 30 by token_id_asc are checked.
+  Crystals 1-50 ARE the original Cosmics → very low miss rate.
+
+**FeeInfoResponse extended:** new `crystal_tier: Option<String>` field
+populated with the highest tier (or `None`). `crystal_holder` kept for
+backwards compat, derived from `crystal_tier.is_some()`.
+
+**Tx events extended:** `buy_nft` action now emits `effective_fee_bps`
+attribute alongside existing `fee` attribute, so off-chain indexers can
+distinguish "1.5% paid because no discount applied" from "1.5% paid because
+buyer is Charged-tier" etc.
+
+**Migration tx:** `BBF4080049A80B2CB4DB05A11E884372C1BD56365776E99627E29D93845C66CF`
+on phoenix-1 height 20720383. New code_id 3849 (was 3848). State preserved
+(no Config field changes).
+
+**Verified on-chain post-migrate:**
+| Wallet | Tier | fee_bps | discount |
+|---|---|---|---|
+| terra10h28ny6... (Crystal #549) | charged | 100 | 50 |
+| terra1cqc26l... (val-key) | cosmic | 0 | 150 |
+| terra18hhej6... (peg-bot) | radiant | 50 | 100 |
+| terra1vrjdx0... (no Crystal) | None | 150 | 0 |
+
+---
+
+
 
 **Auditor**: Claude (single-actor, six independent passes)
 **Date**: 2026-04-25

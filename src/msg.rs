@@ -6,6 +6,11 @@ use crate::state::{Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo}
 // INSTANTIATE
 // ═══════════════════════════════════════════
 
+// V1.1.0 migration takes no parameters — the contract just bumps its
+// cw2 version marker and starts using the new tier-ladder fee logic.
+#[cw_serde]
+pub struct MigrateMsg {}
+
 #[cw_serde]
 pub struct InstantiateMsg {
     /// Total marketplace fee in basis points (e.g. 150 = 1.5%)
@@ -227,8 +232,13 @@ pub struct FeeInfoResponse {
     pub capa_staked: Uint128,
     /// Discount applied in bps
     pub discount_bps: u16,
-    /// Whether buyer holds at least one CAPA Crystal (drops fee to 0)
+    /// Whether buyer holds at least one CAPA Crystal of any tier.
+    /// Kept for backwards compat — derived from `crystal_tier.is_some()`.
     pub crystal_holder: bool,
+    /// V1.1.0: highest Crystal tier owned by buyer. Drives the fee ladder:
+    /// cosmic→0bps, prismatic→25bps, radiant→50bps, charged→100bps,
+    /// raw→fee_bps (no discount), null→no Crystals owned.
+    pub crystal_tier: Option<String>,
 }
 
 #[cw_serde]

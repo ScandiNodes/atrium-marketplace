@@ -12,7 +12,7 @@ use crate::error::ContractError;
 use crate::msg::{
     AllowedCollectionsResponse, CollectionStatsResponse, Cw20HookMsg, ExecuteMsg,
     FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg, ListingsResponse,
-    OffersResponse, QueryMsg, RoyaltyInfoResponse,
+    MigrateMsg, OffersResponse, QueryMsg, RoyaltyInfoResponse,
 };
 use crate::state::{
     Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
@@ -28,6 +28,29 @@ const MAX_LIMIT: u32 = 30;
 const DEFAULT_LIMIT: u32 = 10;
 const MAX_ROYALTY_BPS: u16 = 1500; // 15%
 const MAX_FEE_BPS: u16 = 500; // 5%
+
+// ═══════════════════════════════════════════
+// MIGRATE — V1.0 → V1.1 (tier ladder)
+// ═══════════════════════════════════════════
+//
+// V1.1.0 changes:
+//   • Crystal-holder discount split into a 5-rung tier ladder
+//     (Cosmic 0% / Prismatic 0.25% / Radiant 0.50% / Charged 1.0% / Raw 1.5%)
+//   • Resolution chain: ALTAR → FUSION → MINT (hardcoded mainnet addrs)
+//   • Up to 30 Crystals scanned per buyer to bound gas
+//   • FeeInfoResponse extended with `crystal_tier: Option<String>`
+//
+// No state changes — same Config, same Listings, same Offers. The migrate
+// function only updates the contract version marker and is otherwise a
+// no-op. cw2 stores the new version on-chain so external indexers know.
+
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+    Ok(Response::new()
+        .add_attribute("action", "migrate")
+        .add_attribute("new_version", CONTRACT_VERSION))
+}
 
 // ═══════════════════════════════════════════
 // INSTANTIATE
@@ -586,6 +609,7 @@ fn execute_sale(
         .add_attribute("token_id", &listing.token_id)
         .add_attribute("price", sale_price)
         .add_attribute("fee", fee_amount)
+        .add_attribute("effective_fee_bps", effective_fee_bps.to_string())
         .add_attribute("royalty", royalty_amount)
         .add_attribute("seller_receives", seller_amount))
 }
@@ -1180,41 +1204,148 @@ fn decrement_offers_per_nft(
 /// 2. **CAPA staker** → tier-based discount (25 / 50 / 75 bps off)
 /// 3. **Else** → base fee_bps
 ///
-/// Crystal lookup uses cw721 `Tokens { owner }` — returns up to 1 token to
-/// minimize gas. Empty `tokens` array means non-holder.
+/// V1.1.0 (Alt D — Cosmic-only 0% + tier ladder):
+///
+///   Cosmic       → 0   bps  (free for top-tier holders, ~50 wallets)
+///   Prismatic    → 25  bps  (0.25%)
+///   Radiant      → 50  bps  (0.50%)
+///   Charged      → 100 bps  (1.00%)
+///   Raw / none   → fee_bps  (1.50% default, no discount)
+///
+/// Tier resolution walks ALTAR → FUSION → MINT contracts (mirrors
+/// `feedback_crystal_tier_resolution.md` — ascended/fused crystals
+/// aren't in MINT). Up to TIER_QUERY_LIMIT crystals checked per buyer
+/// to bound gas. Cosmic short-circuits the loop since it's the top.
 fn get_effective_fee(deps: Deps, config: &Config, buyer: &Addr) -> StdResult<u16> {
-    // Crystal-holder check
-    if is_crystal_holder(deps, buyer)? {
-        return Ok(0);
+    // Tier-based ladder
+    let highest = highest_crystal_tier(deps, buyer)?;
+    match highest.as_deref() {
+        Some("cosmic")    => return Ok(0),
+        Some("prismatic") => return Ok(25),
+        Some("radiant")   => return Ok(50),
+        Some("charged")   => return Ok(100),
+        // Raw or no Crystal falls through to base fee
+        _ => {}
     }
 
     // CAPA-staker discount (TODO: integrate when capa_gov_contract is set)
     if let Some(_gov) = &config.capa_gov_contract {
         // Future: query staked CAPA, walk FEE_DISCOUNT_TIERS
         // let staked: StakerResponse = deps.querier.query_wasm_smart(gov, ...)?;
-        // for (threshold, discount_bps) in FEE_DISCOUNT_TIERS.iter() {
-        //     if staked.balance.u128() >= *threshold {
-        //         return Ok(config.fee_bps.saturating_sub(*discount_bps));
-        //     }
-        // }
     }
 
     Ok(config.fee_bps)
 }
 
-/// Returns true if `buyer` owns at least one CAPA Crystal.
-/// Cheap query: asks for the buyer's first token only.
-fn is_crystal_holder(deps: Deps, buyer: &Addr) -> StdResult<bool> {
+// ─── Crystal tier resolution chain (mainnet phoenix-1, hardcoded) ──────────
+// These contract addresses are hardcoded because they're locked at the
+// protocol level on phoenix-1. Future testnet deploys would rebuild with
+// different consts. Reasoning: zero migration surface, no admin can mis-set,
+// less attack surface. See plan_atrium_nft_marketplace.md.
+const ALTAR_NFT_CONTRACT: &str   = "terra1hpjtm8q5r245a797zg0rq42wl4uk0wlvs9a6xet04jka2yj5486sjr96s4";
+const FUSION_NFT_CONTRACT: &str  = "terra1hqhhw5ndpdty4yzteud20a073q93cyupv8rp3wufrv5f7d7xrc8qsuf6kg";
+const MINT_NFT_CONTRACT: &str    = "terra1jez9g0kqq7lze8ncqunvxzs9d2tu4m9p5vep3d2dgs4dxh5nfj9sm9vgl4";
+
+/// Cap on Crystals scanned per buyer to bound gas. Edge case: a whale
+/// holding Cosmic at token_id > 30 with 30+ lower-id tokens may miss
+/// the discount. cw721-base orders by token_id ascending, and Crystals
+/// 1..50 ARE the original Cosmics, so this is a low-prevalence corner.
+const TIER_QUERY_LIMIT: u32 = 30;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+struct CrystalInfoQuery {
+    crystal_info: CrystalInfoArgs,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+struct CrystalInfoArgs {
+    token_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+struct CrystalInfoResponse {
+    #[serde(default)]
+    tier: Option<String>,
+}
+
+/// Returns the buyer's HIGHEST Crystal tier across up to TIER_QUERY_LIMIT
+/// owned tokens. Returns None if buyer has no Crystals OR if every owned
+/// crystal's tier resolves to None across all three sources.
+///
+/// In test environments where ALTAR/FUSION/MINT aren't deployed, every
+/// resolve_tier() returns None and this function returns None — buyers
+/// fall through to fee_bps. Documented in integration_tests.rs.
+pub(crate) fn highest_crystal_tier(deps: Deps, buyer: &Addr) -> StdResult<Option<String>> {
     let crystal = CRYSTAL_NFT_CONTRACT.load(deps.storage)?;
     let resp: TokensResponse = deps.querier.query_wasm_smart(
         crystal,
         &cw721::Cw721QueryMsg::Tokens {
             owner: buyer.to_string(),
             start_after: None,
-            limit: Some(1),
+            limit: Some(TIER_QUERY_LIMIT),
         },
     )?;
-    Ok(!resp.tokens.is_empty())
+    if resp.tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let altar  = deps.api.addr_validate(ALTAR_NFT_CONTRACT)?;
+    let fusion = deps.api.addr_validate(FUSION_NFT_CONTRACT)?;
+    let mint   = deps.api.addr_validate(MINT_NFT_CONTRACT)?;
+
+    let mut highest_rank: u8 = 0;
+    let mut highest_name: Option<&str> = None;
+
+    for token_id in resp.tokens.iter() {
+        let tier = resolve_tier(deps, &altar, &fusion, &mint, token_id);
+        if let Some(t) = tier {
+            let r = tier_rank(&t);
+            if r > highest_rank {
+                highest_rank = r;
+                highest_name = tier_label(r);
+                if r == 5 { break; } // cosmic — short-circuit
+            }
+        }
+    }
+    Ok(highest_name.map(|s| s.to_string()))
+}
+
+fn resolve_tier(deps: Deps, altar: &Addr, fusion: &Addr, mint: &Addr, token_id: &str) -> Option<String> {
+    let q = CrystalInfoQuery {
+        crystal_info: CrystalInfoArgs { token_id: token_id.to_string() },
+    };
+    if let Ok(r) = deps.querier.query_wasm_smart::<CrystalInfoResponse>(altar.clone(), &q) {
+        if r.tier.is_some() { return r.tier; }
+    }
+    if let Ok(r) = deps.querier.query_wasm_smart::<CrystalInfoResponse>(fusion.clone(), &q) {
+        if r.tier.is_some() { return r.tier; }
+    }
+    if let Ok(r) = deps.querier.query_wasm_smart::<CrystalInfoResponse>(mint.clone(), &q) {
+        return r.tier;
+    }
+    None
+}
+
+fn tier_rank(t: &str) -> u8 {
+    match t {
+        "cosmic"    => 5,
+        "prismatic" => 4,
+        "radiant"   => 3,
+        "charged"   => 2,
+        "raw"       => 1,
+        _           => 0,
+    }
+}
+
+fn tier_label(rank: u8) -> Option<&'static str> {
+    match rank {
+        5 => Some("cosmic"),
+        4 => Some("prismatic"),
+        3 => Some("radiant"),
+        2 => Some("charged"),
+        1 => Some("raw"),
+        _ => None,
+    }
 }
 
 // ═══════════════════════════════════════════
@@ -1263,20 +1394,23 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         }
         QueryMsg::FeeInfo { buyer } => {
             let config = CONFIG.load(deps.storage)?;
-            let (fee_bps, discount_bps, holder) = if let Some(b) = buyer {
+            let (fee_bps, discount_bps, tier_opt) = if let Some(b) = buyer {
                 let addr = deps.api.addr_validate(&b)?;
                 let eff = get_effective_fee(deps, &config, &addr)?;
-                let h = is_crystal_holder(deps, &addr).unwrap_or(false);
+                let t = highest_crystal_tier(deps, &addr).unwrap_or(None);
                 // saturating_sub guards a defensive underflow path
-                (eff, config.fee_bps.saturating_sub(eff), h)
+                (eff, config.fee_bps.saturating_sub(eff), t)
             } else {
-                (config.fee_bps, 0, false)
+                (config.fee_bps, 0, None)
             };
+            // crystal_holder kept for backwards compat — derived from tier
+            let holder = tier_opt.is_some();
             to_json_binary(&FeeInfoResponse {
                 fee_bps,
                 capa_staked: Uint128::zero(),
                 discount_bps,
                 crystal_holder: holder,
+                crystal_tier: tier_opt,
             })
         }
         QueryMsg::IsCollectionAllowed { nft_contract } => {
