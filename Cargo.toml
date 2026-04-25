@@ -1,0 +1,40 @@
+[package]
+name = "atrium-marketplace"
+version = "1.0.0-rc1"
+edition = "2021"
+description = "Atrium NFT marketplace contract for Solid — 0% fees for CAPA Crystal holders"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+library = []
+
+[profile.release]
+opt-level = 3
+debug = false
+rpath = false
+lto = true
+debug-assertions = false
+codegen-units = 1
+panic = 'abort'
+incremental = false
+overflow-checks = true
+
+[dependencies]
+cosmwasm-schema = "1.5"
+cosmwasm-std = "1.5"
+cw-storage-plus = "1.2"
+cw2 = "1.1"
+cw20 = "1.1"
+cw721 = "0.18"
+schemars = "0.8"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+cosmwasm-schema = "1.5"
+cw-multi-test = "0.20"
+cw20-base = "1.1"
+cw721-base = "0.18"
+anyhow = "1.0"
