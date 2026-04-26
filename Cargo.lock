@@ -21,7 +21,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "atrium-marketplace"
-version = "1.2.0-rc1"
+version = "1.3.0-rc1"
 dependencies = [
  "anyhow",
  "cosmwasm-schema",
@@ -33,8 +33,10 @@ dependencies = [
  "cw20-base",
  "cw721 0.18.0",
  "cw721-base 0.18.0",
+ "hex",
  "schemars",
  "serde",
+ "sha2 0.10.9",
  "thiserror",
 ]
 

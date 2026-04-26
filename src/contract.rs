@@ -10,16 +10,18 @@ use cw721::TokensResponse;
 
 use crate::error::ContractError;
 use crate::msg::{
-    AllowedCollectionsResponse, CollectionStatsResponse, Cw20HookMsg, ExecuteMsg,
-    FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg, ListingsResponse,
-    MigrateMsg, OffersResponse, QueryMsg, RoyaltyInfoResponse,
+    AllowedCollectionsResponse, CollectionOffersResponse, CollectionStatsResponse, Cw20HookMsg,
+    ExecuteMsg, FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg, ListingsResponse,
+    MigrateMsg, OffersResponse, QueryMsg, RoyaltyInfoResponse, TraitProof, TraitRegistryResponse,
 };
 use crate::state::{
-    Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
+    CollectionOffer, Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
+    TraitConstraint, TraitRegistry,
     ACTIVE_LISTING, ACTIVE_LISTINGS_PER_COLLECTION, ACTIVE_OFFERS_PER_NFT,
-    ALLOWED_COLLECTIONS, CONFIG, CRYSTAL_NFT_CONTRACT, FEE_DISCOUNT_TIERS,
-    LAUNCH_CAPS, LISTING_COUNT, LISTINGS, OFFER_COUNT, OFFERS, OFFERS_BY_NFT,
-    ROYALTIES,
+    ALLOWED_COLLECTIONS, COLLECTION_OFFERS, COLLECTION_OFFER_COUNT,
+    COLLECTION_OFFERS_BY_COLLECTION, CONFIG, CRYSTAL_NFT_CONTRACT, FEE_DISCOUNT_TIERS,
+    LAUNCH_CAPS, LISTING_COUNT, LISTINGS, MAX_MERKLE_DEPTH, MAX_TRADES_PER_OFFER,
+    OFFER_COUNT, OFFERS, OFFERS_BY_NFT, ROYALTIES, TRAIT_REGISTRY,
 };
 
 const CONTRACT_NAME: &str = "crates.io:atrium-marketplace";
@@ -184,6 +186,31 @@ pub fn execute(
         ExecuteMsg::TransferOwnership { new_owner } => {
             execute_transfer_ownership(deps, info, new_owner)
         }
+        ExecuteMsg::MakeCollectionOffer {
+            nft_contract,
+            price_per_nft,
+            constraints,
+            max_trades,
+            expires_in_blocks,
+        } => execute_make_collection_offer_native(
+            deps, env, info, nft_contract, price_per_nft, constraints, max_trades, expires_in_blocks,
+        ),
+        ExecuteMsg::AcceptCollectionOffer {
+            offer_id,
+            token_id,
+            proofs,
+        } => execute_accept_collection_offer(deps, env, info, offer_id, token_id, proofs),
+        ExecuteMsg::CancelCollectionOffer { offer_id } => {
+            execute_cancel_collection_offer(deps, info, offer_id)
+        }
+        ExecuteMsg::WithdrawExpiredCollectionOffer { offer_id } => {
+            execute_withdraw_expired_collection_offer(deps, env, info, offer_id)
+        }
+        ExecuteMsg::SetTraitRegistry {
+            nft_contract,
+            merkle_root_hex,
+            source_url,
+        } => execute_set_trait_registry(deps, env, info, nft_contract, merkle_root_hex, source_url),
     }
 }
 
@@ -312,6 +339,16 @@ fn execute_receive_cw20(
             nft_contract,
             token_id,
             expires_in_blocks,
+        ),
+        Cw20HookMsg::MakeCollectionOffer {
+            nft_contract,
+            price_per_nft,
+            constraints,
+            max_trades,
+            expires_in_blocks,
+        } => execute_make_collection_offer_cw20(
+            deps, env, buyer, cw20_contract, amount, nft_contract,
+            price_per_nft, constraints, max_trades, expires_in_blocks,
         ),
     }
 }
@@ -1442,6 +1479,26 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             })
         }
         QueryMsg::LaunchCaps {} => to_json_binary(&LAUNCH_CAPS.load(deps.storage)?),
+        QueryMsg::CollectionOffer { offer_id } => {
+            to_json_binary(&query_collection_offer(deps, offer_id)?)
+        }
+        QueryMsg::CollectionOffersForCollection {
+            nft_contract,
+            start_after,
+            limit,
+        } => to_json_binary(&query_collection_offers_for_collection(
+            deps, nft_contract, start_after, limit,
+        )?),
+        QueryMsg::CollectionOffersByBuyer {
+            buyer,
+            start_after,
+            limit,
+        } => to_json_binary(&query_collection_offers_by_buyer(
+            deps, buyer, start_after, limit,
+        )?),
+        QueryMsg::TraitRegistry { nft_contract } => {
+            to_json_binary(&query_trait_registry(deps, nft_contract)?)
+        }
     }
 }
 
@@ -1554,6 +1611,560 @@ fn query_allowed_collections(
         .collect();
 
     Ok(AllowedCollectionsResponse { collections })
+}
+
+// ═══════════════════════════════════════════
+// V1.3.0 — COLLECTION OFFERS + TRAIT REGISTRY
+// ═══════════════════════════════════════════
+//
+// Two operator-requested features (Scandalous-collection holder, 2026-04-26):
+//
+//   1. Trait-aware collection offers — buyer says "I'll buy any UNBROKEN
+//      aDAO bird for X SOLID". Solves the bug where a naive collection
+//      offer triggers on a broken/cheap token the buyer didn't want.
+//
+//   2. Bulk SOLID collection offers — buyer locks N × price_per_nft of
+//      escrow and offers to buy up to N tokens. Acts as a floor-defense
+//      mechanism: collection projects can defend a price floor by parking
+//      treasury into a bulk offer.
+//
+// Both share the CollectionOffer struct: max_trades=1 = single-fill,
+// max_trades>1 = bulk. Constraints empty = "any token", non-empty = trait
+// filter (requires the collection to have a registered trait merkle root).
+//
+// LST-on-escrow (originally Feature C in V1_3_DESIGN.md) is OUT OF SCOPE
+// per Daniel 2026-04-26 — paid-audit budget not allocated for that.
+
+// ─── Helpers: hex parsing + sha256 + merkle verification ─────────────────
+
+fn hex_decode_32(hex_str: &str) -> Result<[u8; 32], ContractError> {
+    let bytes = hex::decode(hex_str.trim_start_matches("0x"))
+        .map_err(|_| ContractError::BadMerkleProof {})?;
+    if bytes.len() != 32 {
+        return Err(ContractError::BadMerkleProof {});
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Build the canonical leaf for a (token_id, trait_type, trait_value).
+///
+/// Encoding: `sha256(token_id || "|" || trait_type || "=" || trait_value)`.
+/// The `|` and `=` separators are not allowed inside any of the three
+/// components — the registry-publisher MUST sanitize. (Documented and
+/// enforced off-chain when building the registry.)
+fn merkle_leaf(token_id: &str, trait_type: &str, trait_value: &str) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(token_id.len() + trait_type.len() + trait_value.len() + 2);
+    buf.extend_from_slice(token_id.as_bytes());
+    buf.push(b'|');
+    buf.extend_from_slice(trait_type.as_bytes());
+    buf.push(b'=');
+    buf.extend_from_slice(trait_value.as_bytes());
+    sha256(&buf)
+}
+
+/// Verify a merkle proof. Returns Ok(()) if proof is valid, Err otherwise.
+///
+/// Climbs the tree by hashing `(self || sibling)` if `sibling_on_right=true`,
+/// else `(sibling || self)`. Final hash must equal `expected_root`.
+fn verify_merkle_proof(
+    leaf: [u8; 32],
+    sibling_hashes_hex: &[String],
+    sibling_on_right: &[bool],
+    expected_root: [u8; 32],
+) -> Result<(), ContractError> {
+    if sibling_hashes_hex.len() != sibling_on_right.len() {
+        return Err(ContractError::BadMerkleProof {});
+    }
+    if sibling_hashes_hex.len() > MAX_MERKLE_DEPTH {
+        return Err(ContractError::MerkleProofTooDeep {});
+    }
+    let mut current = leaf;
+    for (i, sib_hex) in sibling_hashes_hex.iter().enumerate() {
+        let sibling = hex_decode_32(sib_hex)?;
+        let mut buf = [0u8; 64];
+        if sibling_on_right[i] {
+            buf[..32].copy_from_slice(&current);
+            buf[32..].copy_from_slice(&sibling);
+        } else {
+            buf[..32].copy_from_slice(&sibling);
+            buf[32..].copy_from_slice(&current);
+        }
+        current = sha256(&buf);
+    }
+    if current != expected_root {
+        return Err(ContractError::BadMerkleProof {});
+    }
+    Ok(())
+}
+
+// ─── Execute: MakeCollectionOffer (native) ───────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn execute_make_collection_offer_native(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    nft_contract: String,
+    price_per_nft: Uint128,
+    constraints: Vec<TraitConstraint>,
+    max_trades: u32,
+    expires_in_blocks: u64,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if config.paused {
+        return Err(ContractError::Paused {});
+    }
+    if info.funds.len() != 1 {
+        return Err(ContractError::MultiDenomSend {});
+    }
+    let coin = &info.funds[0];
+
+    let payment = PaymentType::Native { denom: coin.denom.clone() };
+    let escrow_total = validate_collection_offer_inputs(
+        deps.as_ref(),
+        &nft_contract,
+        price_per_nft,
+        max_trades,
+        &constraints,
+    )?;
+    if coin.amount != escrow_total {
+        return Err(ContractError::EscrowMismatch {
+            expected: escrow_total.to_string(),
+            got: coin.amount.to_string(),
+        });
+    }
+
+    create_collection_offer(
+        deps,
+        env,
+        info.sender,
+        nft_contract,
+        price_per_nft,
+        payment,
+        constraints,
+        max_trades,
+        expires_in_blocks,
+        escrow_total,
+    )
+}
+
+// ─── Execute: MakeCollectionOffer (CW20) ─────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn execute_make_collection_offer_cw20(
+    deps: DepsMut,
+    env: Env,
+    buyer: Addr,
+    cw20_contract: Addr,
+    amount: Uint128,
+    nft_contract: String,
+    price_per_nft: Uint128,
+    constraints: Vec<TraitConstraint>,
+    max_trades: u32,
+    expires_in_blocks: u64,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if config.paused {
+        return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
+            .add_attribute("action", "make_collection_offer_refund")
+            .add_attribute("reason", "paused"));
+    }
+
+    // Validate inputs; on failure refund the CW20 (we already received funds).
+    let escrow_total = match validate_collection_offer_inputs(
+        deps.as_ref(),
+        &nft_contract,
+        price_per_nft,
+        max_trades,
+        &constraints,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
+                .add_attribute("action", "make_collection_offer_refund")
+                .add_attribute("reason", format!("{:?}", e)));
+        }
+    };
+
+    if amount != escrow_total {
+        return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
+            .add_attribute("action", "make_collection_offer_refund")
+            .add_attribute("reason", "escrow_mismatch"));
+    }
+
+    let payment = PaymentType::Cw20 { contract_addr: cw20_contract.to_string() };
+    create_collection_offer(
+        deps,
+        env,
+        buyer,
+        nft_contract,
+        price_per_nft,
+        payment,
+        constraints,
+        max_trades,
+        expires_in_blocks,
+        escrow_total,
+    )
+}
+
+/// Shared validation for native + CW20 paths. Returns required escrow total.
+fn validate_collection_offer_inputs(
+    deps: Deps,
+    nft_contract: &str,
+    price_per_nft: Uint128,
+    max_trades: u32,
+    constraints: &[TraitConstraint],
+) -> Result<Uint128, ContractError> {
+    if price_per_nft.is_zero() {
+        return Err(ContractError::ZeroPrice {});
+    }
+    if max_trades == 0 {
+        return Err(ContractError::MaxTradesZero {});
+    }
+    if max_trades > MAX_TRADES_PER_OFFER {
+        return Err(ContractError::MaxTradesTooHigh { cap: MAX_TRADES_PER_OFFER });
+    }
+    // Validate the collection address parses (we don't require allowlist —
+    // collection offers can target any cw721; sellers need an allowlisted
+    // active listing to fulfil, that's the gate).
+    deps.api.addr_validate(nft_contract)?;
+    // If constraints are present, the collection must have a registered
+    // trait merkle root — otherwise no proof is verifiable at accept-time.
+    if !constraints.is_empty() && !TRAIT_REGISTRY.has(deps.storage, nft_contract) {
+        return Err(ContractError::NoTraitRegistry {});
+    }
+    let escrow_total = price_per_nft
+        .checked_mul(Uint128::from(max_trades as u128))
+        .map_err(|_| ContractError::EscrowMismatch {
+            expected: "<overflow>".to_string(),
+            got: "n/a".to_string(),
+        })?;
+    Ok(escrow_total)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_collection_offer(
+    deps: DepsMut,
+    env: Env,
+    buyer: Addr,
+    nft_contract: String,
+    price_per_nft: Uint128,
+    payment: PaymentType,
+    constraints: Vec<TraitConstraint>,
+    max_trades: u32,
+    expires_in_blocks: u64,
+    escrow_total: Uint128,
+) -> Result<Response, ContractError> {
+    let nft_addr = deps.api.addr_validate(&nft_contract)?;
+
+    let id = COLLECTION_OFFER_COUNT.may_load(deps.storage)?.unwrap_or(0) + 1;
+    COLLECTION_OFFER_COUNT.save(deps.storage, &id)?;
+
+    let expires_at = if expires_in_blocks > 0 {
+        env.block.height + expires_in_blocks
+    } else {
+        0
+    };
+
+    let offer = CollectionOffer {
+        id,
+        buyer: buyer.clone(),
+        nft_contract: nft_addr.clone(),
+        price_per_nft,
+        payment,
+        constraints,
+        max_trades,
+        trades_filled: 0,
+        escrow_balance: escrow_total,
+        expires_at,
+        created_at: env.block.height,
+    };
+
+    COLLECTION_OFFERS.save(deps.storage, id, &offer)?;
+    COLLECTION_OFFERS_BY_COLLECTION.save(deps.storage, (nft_addr.as_str(), id), &())?;
+
+    Ok(Response::new()
+        .add_attribute("action", "make_collection_offer")
+        .add_attribute("offer_id", id.to_string())
+        .add_attribute("buyer", buyer)
+        .add_attribute("nft_contract", nft_contract)
+        .add_attribute("price_per_nft", price_per_nft)
+        .add_attribute("max_trades", max_trades.to_string())
+        .add_attribute("escrow_total", escrow_total))
+}
+
+// ─── Execute: AcceptCollectionOffer ──────────────────────────────────────
+
+fn execute_accept_collection_offer(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    offer_id: u64,
+    token_id: String,
+    proofs: Vec<TraitProof>,
+) -> Result<Response, ContractError> {
+    let mut offer = COLLECTION_OFFERS
+        .may_load(deps.storage, offer_id)?
+        .ok_or(ContractError::CollectionOfferNotFound { id: offer_id })?;
+
+    if offer.expires_at > 0 && env.block.height >= offer.expires_at {
+        return Err(ContractError::CollectionOfferExpired {});
+    }
+    if offer.trades_filled >= offer.max_trades {
+        return Err(ContractError::CollectionOfferFull {});
+    }
+
+    // Seller must have an active listing of this token in this collection,
+    // AND the listing's payment type must match the offer's. Mirrors the
+    // single-NFT AcceptOffer path.
+    let listing_id = ACTIVE_LISTING
+        .may_load(deps.storage, (offer.nft_contract.as_str(), token_id.as_str()))?
+        .ok_or(ContractError::NotListedBySeller {})?;
+    let listing = LISTINGS.load(deps.storage, listing_id)?;
+    if info.sender != listing.seller {
+        return Err(ContractError::NotListedBySeller {});
+    }
+    match (&listing.payment, &offer.payment) {
+        (PaymentType::Native { denom: d1 }, PaymentType::Native { denom: d2 }) if d1 == d2 => {}
+        (PaymentType::Cw20 { contract_addr: c1 }, PaymentType::Cw20 { contract_addr: c2 })
+            if c1 == c2 => {}
+        _ => {
+            return Err(ContractError::WrongPaymentType {
+                expected: format!("{:?}", offer.payment),
+            })
+        }
+    }
+
+    // Trait verification: one proof per constraint, AND-semantics across.
+    if proofs.len() != offer.constraints.len() {
+        return Err(ContractError::ProofCountMismatch {
+            expected: offer.constraints.len(),
+            got: proofs.len(),
+        });
+    }
+    if !offer.constraints.is_empty() {
+        let registry = TRAIT_REGISTRY
+            .may_load(deps.storage, offer.nft_contract.as_str())?
+            .ok_or(ContractError::NoTraitRegistry {})?;
+        for (constraint, proof) in offer.constraints.iter().zip(proofs.iter()) {
+            // The proof must attest a trait_type matching this constraint
+            // and a trait_value the constraint accepts.
+            if proof.trait_type != constraint.trait_type
+                || !constraint.accepted_values.contains(&proof.trait_value)
+            {
+                return Err(ContractError::TraitConstraintFailed {
+                    trait_type: constraint.trait_type.clone(),
+                    accepted_values: constraint.accepted_values.clone(),
+                });
+            }
+            // And the proof must verify against the registered root.
+            let leaf = merkle_leaf(&token_id, &proof.trait_type, &proof.trait_value);
+            verify_merkle_proof(
+                leaf,
+                &proof.sibling_hashes_hex,
+                &proof.sibling_on_right,
+                registry.merkle_root,
+            )?;
+        }
+    }
+
+    // Drain one slot of escrow + bump trades_filled BEFORE execute_sale
+    // (which consumes deps).
+    offer.trades_filled = offer.trades_filled.checked_add(1).unwrap_or(offer.max_trades);
+    offer.escrow_balance = offer
+        .escrow_balance
+        .checked_sub(offer.price_per_nft)
+        .unwrap_or(Uint128::zero());
+    if offer.trades_filled >= offer.max_trades {
+        // Auto-close: remove from indexes.
+        COLLECTION_OFFERS.remove(deps.storage, offer_id);
+        COLLECTION_OFFERS_BY_COLLECTION.remove(
+            deps.storage,
+            (offer.nft_contract.as_str(), offer_id),
+        );
+    } else {
+        COLLECTION_OFFERS.save(deps.storage, offer_id, &offer)?;
+    }
+
+    // Execute the sale at price_per_nft (NOT listing.price — collection
+    // offer dictates).
+    let result = execute_sale(deps, &offer.buyer, &listing, offer.price_per_nft, &offer.payment)?;
+    Ok(result.add_attribute("accepted_collection_offer_id", offer_id.to_string()))
+}
+
+// ─── Execute: CancelCollectionOffer ──────────────────────────────────────
+
+fn execute_cancel_collection_offer(
+    deps: DepsMut,
+    info: MessageInfo,
+    offer_id: u64,
+) -> Result<Response, ContractError> {
+    let offer = COLLECTION_OFFERS
+        .may_load(deps.storage, offer_id)?
+        .ok_or(ContractError::CollectionOfferNotFound { id: offer_id })?;
+    if info.sender != offer.buyer {
+        return Err(ContractError::NotBuyer {});
+    }
+    refund_collection_offer_and_close(deps, offer)
+}
+
+// ─── Execute: WithdrawExpiredCollectionOffer ─────────────────────────────
+
+fn execute_withdraw_expired_collection_offer(
+    deps: DepsMut,
+    env: Env,
+    _info: MessageInfo,
+    offer_id: u64,
+) -> Result<Response, ContractError> {
+    let offer = COLLECTION_OFFERS
+        .may_load(deps.storage, offer_id)?
+        .ok_or(ContractError::CollectionOfferNotFound { id: offer_id })?;
+    if offer.expires_at == 0 {
+        return Err(ContractError::OfferNotExpired {});
+    }
+    if env.block.height < offer.expires_at {
+        return Err(ContractError::OfferNotExpired {});
+    }
+    refund_collection_offer_and_close(deps, offer)
+}
+
+/// Refund the buyer's remaining escrow + remove offer + cleanup indexes.
+fn refund_collection_offer_and_close(
+    deps: DepsMut,
+    offer: CollectionOffer,
+) -> Result<Response, ContractError> {
+    let refund_amount = offer.escrow_balance;
+    let mut messages: Vec<CosmosMsg> = vec![];
+    if !refund_amount.is_zero() {
+        match &offer.payment {
+            PaymentType::Native { denom } => {
+                messages.push(CosmosMsg::Bank(BankMsg::Send {
+                    to_address: offer.buyer.to_string(),
+                    amount: vec![Coin { denom: denom.clone(), amount: refund_amount }],
+                }));
+            }
+            PaymentType::Cw20 { contract_addr } => {
+                messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: contract_addr.clone(),
+                    msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                        recipient: offer.buyer.to_string(),
+                        amount: refund_amount,
+                    })?,
+                    funds: vec![],
+                }));
+            }
+        }
+    }
+    COLLECTION_OFFERS.remove(deps.storage, offer.id);
+    COLLECTION_OFFERS_BY_COLLECTION.remove(
+        deps.storage,
+        (offer.nft_contract.as_str(), offer.id),
+    );
+    Ok(Response::new()
+        .add_messages(messages)
+        .add_attribute("action", "cancel_collection_offer")
+        .add_attribute("offer_id", offer.id.to_string())
+        .add_attribute("buyer", offer.buyer)
+        .add_attribute("refunded", refund_amount))
+}
+
+// ─── Execute: SetTraitRegistry ───────────────────────────────────────────
+
+fn execute_set_trait_registry(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    nft_contract: String,
+    merkle_root_hex: String,
+    source_url: Option<String>,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.owner {
+        return Err(ContractError::NotAdmin {});
+    }
+    let nft_addr = deps.api.addr_validate(&nft_contract)?;
+    let merkle_root = hex_decode_32(&merkle_root_hex)?;
+    let registry = TraitRegistry {
+        merkle_root,
+        updated_at: env.block.height,
+        updated_by: info.sender.clone(),
+        source_url: source_url.clone(),
+    };
+    TRAIT_REGISTRY.save(deps.storage, nft_addr.as_str(), &registry)?;
+    let mut resp = Response::new()
+        .add_attribute("action", "set_trait_registry")
+        .add_attribute("nft_contract", nft_contract)
+        .add_attribute("merkle_root", merkle_root_hex);
+    // cosmwasm-std rejects empty attribute values — only emit source_url
+    // when actually present.
+    if let Some(u) = source_url {
+        if !u.is_empty() {
+            resp = resp.add_attribute("source_url", u);
+        }
+    }
+    Ok(resp)
+}
+
+// ─── Queries ─────────────────────────────────────────────────────────────
+
+fn query_collection_offer(deps: Deps, offer_id: u64) -> StdResult<CollectionOffer> {
+    COLLECTION_OFFERS.load(deps.storage, offer_id)
+}
+
+fn query_collection_offers_for_collection(
+    deps: Deps,
+    nft_contract: String,
+    start_after: Option<u64>,
+    limit: Option<u32>,
+) -> StdResult<CollectionOffersResponse> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
+    let start = start_after.map(cw_storage_plus::Bound::exclusive);
+    let offers: Vec<CollectionOffer> = COLLECTION_OFFERS_BY_COLLECTION
+        .prefix(nft_contract.as_str())
+        .range(deps.storage, start, None, Order::Ascending)
+        .take(limit)
+        .filter_map(|item| {
+            item.ok()
+                .and_then(|(offer_id, _)| COLLECTION_OFFERS.load(deps.storage, offer_id).ok())
+        })
+        .collect();
+    Ok(CollectionOffersResponse { offers })
+}
+
+fn query_collection_offers_by_buyer(
+    deps: Deps,
+    buyer: String,
+    start_after: Option<u64>,
+    limit: Option<u32>,
+) -> StdResult<CollectionOffersResponse> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
+    let start = start_after.map(cw_storage_plus::Bound::exclusive);
+    // Linear scan — V1 acceptable while volume is bounded. V2 candidate:
+    // secondary index by buyer.
+    let offers: Vec<CollectionOffer> = COLLECTION_OFFERS
+        .range(deps.storage, start, None, Order::Ascending)
+        .filter_map(|item| {
+            item.ok().and_then(|(_, o)| {
+                if o.buyer.as_str() == buyer { Some(o) } else { None }
+            })
+        })
+        .take(limit)
+        .collect();
+    Ok(CollectionOffersResponse { offers })
+}
+
+fn query_trait_registry(deps: Deps, nft_contract: String) -> StdResult<TraitRegistryResponse> {
+    let registry = TRAIT_REGISTRY.may_load(deps.storage, &nft_contract)?;
+    Ok(TraitRegistryResponse { registry })
 }
 
 // ═══════════════════════════════════════════

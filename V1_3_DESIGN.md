@@ -1,12 +1,14 @@
-# Atrium V1.3 — design doc (trait-aware offers + bulk + LST escrow)
+# Atrium V1.3 — design doc (trait-aware offers + bulk SOLID escrow)
 
 Drafted 2026-04-26 in response to operator feedback (Scandalous-collection
-holder). Three V1.3 features, ranked by complexity + risk.
+holder). Two V1.3 features. **LST-on-escrow (originally Feature C) is
+explicitly OUT of scope per Daniel 2026-04-26 — pool-dep risk + paid
+audit budget not allocated.**
 
-> **Important:** V1.3 is NOT a code-now session. Each feature below
-> needs ≥1 day of contract work + new integration tests + paid audit
-> before mainnet because they introduce new escrow flows + new attack
-> surface. This doc is the design + scope contract for that work.
+> Status: **shipping V1.3.0 in this session.** A + B implemented as one
+> unified CollectionOffer struct (single-fill = max_trades=1, bulk =
+> max_trades>1). Internal Claude audit only — no paid audit needed
+> because no external pool deps, no swap-flow complexity.
 
 ---
 
@@ -180,94 +182,30 @@ pub struct CollectionOffer {
 
 ---
 
-## Feature C — LST on escrow (yield on parked funds)
+## Feature C (REMOVED) — LST on escrow
 
-### Problem
-
-Per Scandalous-op:
-> "Might be smart to enable a LST for the escrow account. Would be
-> nice if your parking funds in escrow account it needs to be able to
-> earn an APY while it's parked."
-
-Both single-NFT offers and (especially) bulk collection offers can have
-significant SOLID parked for days/weeks. Idle SOLID = lost yield.
-
-### Design
-
-When buyer makes an offer, instead of holding raw SOLID in marketplace,
-swap it into ampSOLID (Eris-style auto-compounding LST) at offer-time.
-At accept/cancel, swap back to SOLID and deliver.
-
-**Atomicity problem:** Swap-back at accept-time can fail (slippage,
-pool imbalance). If swap fails, accept fails — bad UX (seller wants
-to accept their valid offer; can't because of pool conditions).
-
-**Mitigation:**
-1. Set a minimum slippage tolerance (default 1%, configurable per offer).
-2. If swap fails, fallback to keep escrow in ampSOLID — seller receives
-   ampSOLID instead of SOLID, can swap themselves.
-3. UI shows "this offer parks in ampSOLID — accepting may take 2 txs
-   if slippage spikes."
-
-**Pricing risk for buyer:** ampSOLID/SOLID rate changes over time. If
-buyer offers 100 SOLID and rate moves, they may pay slightly more or
-less in actual SOLID terms. Disclosed at offer-time.
-
-### Required infra
-
-- ampSOLID contract address (or similar SOLID LST)
-- Astroport SOLID/ampSOLID pool address
-- Per-offer config: `enable_lst: bool` (opt-in default off in V1.3,
-  flip to default on after burn-in)
-
-### State changes
-
-```rust
-pub struct Offer {
-    // ... existing fields ...
-    pub escrow_denom: EscrowDenom,  // Native | Cw20 | LstAmpSolid
-    pub original_amount: Uint128,   // for buyer's reference
-}
-```
-
-### Gas + scope + RISK
-
-- Code: +300 lines (swap msg construction, slippage handling, fallback)
-- New attack surface: pool-manipulation, sandwich attacks at swap
-- Tests: 10 new invariants (swap-fail handling, slippage edge cases,
-  fallback path, oracle deviation)
-- Estimated work: **8 hours impl + tests; 4 hours audit pass**
-- **MUST have paid audit before mainnet** — first feature that
-  introduces external pool dependencies.
+**Decision 2026-04-26 (Daniel): out of scope.** Pool-dep + sandwich
+attack surface too large for unaudited release; paid audit budget not
+allocated. May revisit when SOLID LP-yield matures + budget exists.
 
 ---
 
-## Cumulative scope
+## Cumulative scope (A + B only)
 
 | Feature | Hours | Wasm size | Audit need |
 |---|---|---|---|
 | A — Trait-aware offers | 5 + 3 | +20 KB | Internal (Claude 6-pass) |
 | B — Bulk SOLID escrow | 3 + 2 | +5 KB on A | Internal |
-| C — LST escrow | 8 + 4 | +15 KB | **Paid audit required** |
-| **Total** | **25 hours** | **+40 KB** | One paid pass |
+| **Total** | **13 hours** | **+25 KB** | Internal only |
 
----
-
-## Recommended sequence
-
-1. Merge Feature A first (next session, ~1 day) — unlocks both B and C
-2. Merge Feature B next (~½ day) — instant value for collection projects
-3. Hold Feature C until paid audit budget is allocated
-
-V1.3.A could ship in 1 day; V1.3.B in 2 days. V1.3.C is a multi-week
-project with paid audit.
+Implementation note: A and B share state struct. `CollectionOffer.max_trades=1`
+is single-fill (Feature A); `max_trades>1` is bulk (Feature B). One execute
+flow, one cancel flow, one query path.
 
 ---
 
 ## Status
 
 - [x] Design doc drafted
-- [ ] Daniel review + scope-confirm
-- [ ] V1.3.A implementation
-- [ ] V1.3.B implementation
-- [ ] V1.3.C scoping + audit budget
+- [x] Daniel scope-confirm — A + B yes, C dropped
+- [ ] V1.3.0 implementation in progress (this session)

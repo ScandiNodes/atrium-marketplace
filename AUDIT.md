@@ -1,4 +1,118 @@
-# Atrium Marketplace — Internal Audit (v1.2.0-rc1)
+# Atrium Marketplace — Internal Audit (v1.3.0-rc1)
+
+## V1.3.0 — Trait-aware + bulk SOLID collection offers (Daniel 2026-04-26)
+
+Two operator-requested features (Scandalous-collection holder, 2026-04-26):
+- Trait-aware collection offers (Broken/Unbroken filter for aDAO etc.)
+- Bulk SOLID collection offers with escrow (floor-defense mechanism)
+
+LST-on-escrow (originally Feature C in V1_3_DESIGN.md) explicitly OUT of
+scope per Daniel — paid-audit budget not allocated for that complexity.
+
+### New surface
+
+| Component | Purpose |
+|---|---|
+| `CollectionOffer` struct | Single-fill (max_trades=1) or bulk (>1). Constraints empty = "any token", non-empty = trait-filtered |
+| `TraitConstraint` struct | `{trait_type, accepted_values}` — AND across constraints, OR within |
+| `TraitRegistry` struct | Per-collection sha256-merkle root over leaves `(token_id, trait_type, trait_value)` |
+| `MakeCollectionOffer{Cw20}` execute | Native + CW20 escrow paths |
+| `AcceptCollectionOffer` execute | Seller fulfils with merkle proofs |
+| `CancelCollectionOffer` execute | Buyer cancels, remaining escrow refunded |
+| `WithdrawExpiredCollectionOffer` execute | Anyone refunds expired offer to buyer |
+| `SetTraitRegistry` execute | Admin pushes/replaces merkle root |
+| `CollectionOffer{ForCollection,ByBuyer}` queries | Indexed reads |
+| `TraitRegistry` query | Inspect a collection's registry |
+
+### Verification semantics
+
+- Constraints check: every constraint must have a matching proof at same
+  index. Each proof's (trait_type, trait_value) must satisfy the constraint
+  AND the merkle proof must verify against the registered root.
+- Sale price uses offer's `price_per_nft` (NOT listing.price) so collection
+  offer dictates settlement value. Listing's payment type MUST match
+  offer's payment type.
+- Payment + fee + royalty math reuses `execute_sale` — same fee splits as
+  single-NFT buys, same Cosmic-discount routing.
+
+### Caps + safety rails
+
+| Rail | Value | Purpose |
+|---|---|---|
+| `MAX_TRADES_PER_OFFER` | 1000 | Caps escrow lock per offer + event-spam |
+| `MAX_MERKLE_DEPTH` | 16 | Caps proof verification gas (≤65K leaves) |
+| Escrow == price × max_trades | enforced at create | Prevents under/overpay |
+| Constraints non-empty → registry required | enforced at create | Prevents un-verifiable offers |
+| pause-switch | inherits from Config | Admin can stop everything |
+| Collection-offer auto-removed on full fill | `trades_filled == max_trades` | No zombie offers |
+
+### Gas analysis
+
+- MakeCollectionOffer (no constraints): ~120K gas
+- MakeCollectionOffer (3 constraints): ~150K gas (+10K per constraint)
+- AcceptCollectionOffer (no constraints): ~280K gas (sale + cleanup)
+- AcceptCollectionOffer (with N proofs): ~280K + 50K × N (merkle verify)
+- CancelCollectionOffer: ~80K gas (refund + cleanup)
+- SetTraitRegistry: ~60K gas
+
+### Migration phoenix-1
+
+| | Värde |
+|---|---|
+| Wasm sha256 | `5feeba040153322da69a8108ea5cfa21f4cd8445d54b878f4ce96398bebcea5c` |
+| Wasm storlek | ~415 KB (+~40 KB on V1.2 — adds collection-offer flow + sha2/hex deps) |
+| Optimizer | `cosmwasm/optimizer:0.16.0` |
+| Store-tx | `1A9A3A942199693EE52F163F274AB6EC292DA600A5485EBF82F7C366C83ACADD` (h. 20725211) |
+| Migrate-tx | `7EFF1971A6040F31053C7B58A7F994E35C101CA8826BD20655B4A3497A057FE3` (h. 20725216) |
+| Old code_id | 3850 |
+| New code_id | **3851** |
+| Contract | `terra15du229lqcxkn939pmjgklqunftf604q4wz87kt5awj6reghec5jqs0w0kj` |
+
+### Test coverage
+
+37/37 invariants pass (`cargo test --lib`). 8 new V1.3 invariants:
+
+| # | Tests |
+|---|---|
+| 30 | MakeCollectionOffer native, no constraints — escrows + queryable |
+| 31 | Bulk offer escrow MUST equal price × max_trades |
+| 32 | Constraints require trait registry on collection |
+| 33 | CancelCollectionOffer refunds remaining escrow |
+| 34 | AcceptCollectionOffer no-constraints settles + transfers NFT + 1.5% fee |
+| 35 | Bulk offer partial fill → remaining escrow + auto-close on final fill |
+| 36 | Trait-constrained offer accepts valid proof, rejects wrong trait_value |
+| 37 | Bad merkle proof against real registry rejected |
+
+### Findings (V1.3-specific)
+
+**No critical, no high.** Three low findings:
+
+- **L-V1.3.1 [LOW]** `MAX_MERKLE_DEPTH=16` is per-proof; an attacker
+  could submit MANY constraints (offer-creator) each with a 16-deep
+  proof, multiplying verification cost. Mitigation: practical
+  constraint counts are small (≤5). Add `MAX_CONSTRAINTS_PER_OFFER` cap
+  in V1.4 if economically motivated abuse appears.
+
+- **L-V1.3.2 [LOW]** `validate_collection_offer_inputs` doesn't
+  enforce that `nft_contract` is on the allowlist. Rationale: collection
+  offers can target ANY cw721; the allowlist gate fires later when a
+  seller tries to fulfil (their listing must be in an allowed collection).
+  Tradeoff: spam offers possible against non-allowlisted collections,
+  but they can never actually fill, so escrow is recoverable via
+  `CancelCollectionOffer`. Documented; no behaviour change planned.
+
+- **L-V1.3.3 [LOW]** `SetTraitRegistry` invalidates outstanding proofs
+  silently — sellers with mid-flight accept-flows could see their tx
+  revert. Frontend MUST warn the admin before pushing a new root if
+  there are outstanding collection offers on the collection. Captured
+  in V1_3_DESIGN.md operator-runbook.
+
+### State preservation
+
+Migration is purely additive — V1.0/V1.1/V1.2 state untouched. Existing
+listings (#4-7), offers (none), royalties, allowlist, caps all intact.
+
+---
 
 ## V1.2.0 — Cosmic-only discount + 5% base fee (Daniel 2026-04-26)
 

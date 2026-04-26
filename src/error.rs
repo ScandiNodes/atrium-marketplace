@@ -97,4 +97,57 @@ pub enum ContractError {
     /// Multi-coin send to a single-denom entrypoint.
     #[error("Send exactly one coin denomination — multi-denom sends would lock the surplus")]
     MultiDenomSend {},
+
+    // ─── V1.3.0: Collection offers + trait registry ──────────────────────
+
+    #[error("Collection offer not found: {id}")]
+    CollectionOfferNotFound { id: u64 },
+
+    #[error("Collection offer has expired")]
+    CollectionOfferExpired {},
+
+    #[error("Collection offer is fully filled — no remaining capacity")]
+    CollectionOfferFull {},
+
+    /// Trait constraints can only be applied to collections with a registered
+    /// merkle-trait-root. Push a registry via SetTraitRegistry first.
+    #[error("Collection has no trait registry — cannot apply trait constraints")]
+    NoTraitRegistry {},
+
+    /// Buyer requested too many fills (max_trades) on a single collection
+    /// offer; bound exists to cap escrow/event-spam from a single buyer.
+    #[error("max_trades exceeds the per-offer ceiling ({cap})")]
+    MaxTradesTooHigh { cap: u32 },
+
+    /// Buyer requested zero fills.
+    #[error("max_trades must be at least 1")]
+    MaxTradesZero {},
+
+    /// Funds buyer escrowed for a bulk offer don't match price_per_nft × max_trades.
+    #[error("Escrow mismatch: expected {expected} (= price_per_nft × max_trades), got {got}")]
+    EscrowMismatch { expected: String, got: String },
+
+    /// Merkle proof failed verification against the registered root.
+    #[error("Merkle proof failed verification — token's traits don't match the registry root")]
+    BadMerkleProof {},
+
+    /// Provided merkle proof is too long (exceeds MAX_MERKLE_DEPTH).
+    #[error("Merkle proof too deep (exceeds cap)")]
+    MerkleProofTooDeep {},
+
+    /// Buyer's submitted token does not satisfy one or more trait constraints.
+    #[error("Token traits don't match the offer's constraints (need {trait_type} ∈ {accepted_values:?})")]
+    TraitConstraintFailed {
+        trait_type: String,
+        accepted_values: Vec<String>,
+    },
+
+    /// Constraint count + proofs supplied don't line up.
+    #[error("One merkle proof required per constraint — got {got}, expected {expected}")]
+    ProofCountMismatch { got: usize, expected: usize },
+
+    /// NFT for an accept-collection-offer must be currently listed AND owned
+    /// by the seller-initiator (mirrors AcceptOffer's NoActiveListing rail).
+    #[error("NFT must be actively listed by you to fulfil this collection offer")]
+    NotListedBySeller {},
 }

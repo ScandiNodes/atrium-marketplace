@@ -12,10 +12,10 @@ use cw20::{Cw20Coin, Cw20ExecuteMsg, MinterResponse};
 use cw_multi_test::{App, AppBuilder, Contract, ContractWrapper, Executor};
 
 use crate::msg::{
-    Cw20HookMsg, ExecuteMsg, FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg,
-    QueryMsg,
+    CollectionOffersResponse, Cw20HookMsg, ExecuteMsg, FeeInfoResponse, InstantiateMsg,
+    IsAllowedResponse, ListNftMsg, QueryMsg, TraitProof, TraitRegistryResponse,
 };
-use crate::state::{LaunchCaps, PaymentType};
+use crate::state::{CollectionOffer, LaunchCaps, PaymentType, TraitConstraint};
 
 // ─── Contract wrappers ─────────────────────────────────────────────────────
 
@@ -1281,4 +1281,472 @@ fn invariant_29_transfer_ownership_works() {
             &[],
         )
         .unwrap();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.3.0 — Collection offers + trait registry
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Test helpers for merkle proofs. We hand-build single-leaf "trees" (root =
+// leaf hash itself, no siblings) for the simplest constraint case, and a
+// 2-leaf tree (root = sha256(leftLeaf || rightLeaf)) for sibling-required
+// proofs. Anything bigger is overkill at this layer — verify_merkle_proof()
+// itself is unit-tested implicitly via these flows.
+
+fn sha256_test(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+fn leaf_hash(token_id: &str, trait_type: &str, trait_value: &str) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(token_id.as_bytes());
+    buf.push(b'|');
+    buf.extend_from_slice(trait_type.as_bytes());
+    buf.push(b'=');
+    buf.extend_from_slice(trait_value.as_bytes());
+    sha256_test(&buf)
+}
+
+fn hex32(b: [u8; 32]) -> String {
+    hex::encode(b)
+}
+
+/// Set up a trait registry with EXACTLY ONE leaf for the given (token, type, value).
+/// merkle_root = leaf hash itself. Proof at accept-time = empty siblings.
+fn set_single_leaf_registry(
+    fx: &mut Fixture,
+    nft_contract: &str,
+    token_id: &str,
+    trait_type: &str,
+    trait_value: &str,
+) {
+    let leaf = leaf_hash(token_id, trait_type, trait_value);
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::SetTraitRegistry {
+                nft_contract: nft_contract.into(),
+                merkle_root_hex: hex32(leaf),
+                source_url: None,
+            },
+            &[],
+        )
+        .unwrap();
+}
+
+// ─── Inv 30 ─────────────────────────────────────────────────────────────────
+// MakeCollectionOffer (native, no constraints) → escrow held + queryable
+
+#[test]
+fn invariant_30_make_collection_offer_native_no_constraints_escrows_funds() {
+    let mut fx = setup();
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(100),
+                constraints: vec![],
+                max_trades: 1,
+                expires_in_blocks: 0,
+            },
+            &[coin(100, DENOM)],
+        )
+        .unwrap();
+
+    let offer: CollectionOffer = fx
+        .app
+        .wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::CollectionOffer { offer_id: 1 })
+        .unwrap();
+    assert_eq!(offer.buyer.as_str(), "alice");
+    assert_eq!(offer.escrow_balance, Uint128::new(100));
+    assert_eq!(offer.max_trades, 1);
+    assert_eq!(offer.trades_filled, 0);
+}
+
+// ─── Inv 31 ─────────────────────────────────────────────────────────────────
+// Bulk offer (max_trades > 1) requires escrow = price * max_trades
+
+#[test]
+fn invariant_31_bulk_offer_escrow_must_equal_price_times_max_trades() {
+    let mut fx = setup();
+    // Send too little — should reject
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(100),
+                constraints: vec![],
+                max_trades: 5,                 // expects 500
+                expires_in_blocks: 0,
+            },
+            &[coin(400, DENOM)],
+        )
+        .unwrap_err();
+    assert_err(&err, "Escrow mismatch");
+
+    // Correct escrow succeeds
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(100),
+                constraints: vec![],
+                max_trades: 5,
+                expires_in_blocks: 0,
+            },
+            &[coin(500, DENOM)],
+        )
+        .unwrap();
+}
+
+// ─── Inv 32 ─────────────────────────────────────────────────────────────────
+// Constraints non-empty REQUIRES a trait registry on the collection
+
+#[test]
+fn invariant_32_constraints_require_trait_registry() {
+    let mut fx = setup();
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(100),
+                constraints: vec![TraitConstraint {
+                    trait_type: "Status".into(),
+                    accepted_values: vec!["Unbroken".into()],
+                }],
+                max_trades: 1,
+                expires_in_blocks: 0,
+            },
+            &[coin(100, DENOM)],
+        )
+        .unwrap_err();
+    assert_err(&err, "no trait registry");
+}
+
+// ─── Inv 33 ─────────────────────────────────────────────────────────────────
+// Cancel collection offer refunds remaining escrow
+
+#[test]
+fn invariant_33_cancel_collection_offer_refunds_buyer() {
+    let mut fx = setup();
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(500),
+                constraints: vec![],
+                max_trades: 1,
+                expires_in_blocks: 0,
+            },
+            &[coin(500, DENOM)],
+        )
+        .unwrap();
+
+    let bal_before = fx
+        .app
+        .wrap()
+        .query_balance("alice", DENOM)
+        .unwrap()
+        .amount;
+
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::CancelCollectionOffer { offer_id: 1 },
+            &[],
+        )
+        .unwrap();
+
+    let bal_after = fx
+        .app
+        .wrap()
+        .query_balance("alice", DENOM)
+        .unwrap()
+        .amount;
+
+    assert_eq!(bal_after - bal_before, Uint128::new(500));
+}
+
+// ─── Inv 34 ─────────────────────────────────────────────────────────────────
+// Accept collection offer (no constraints) — listing's seller fulfils, NFT
+// transfers, fee + capa-pool routed correctly, listing removed.
+
+#[test]
+fn invariant_34_accept_collection_offer_no_constraints_settles() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+
+    // Bob makes a collection offer at 800K (less than listing price — that's
+    // OK for collection offers; offer's price_per_nft drives the sale)
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(800_000),
+                constraints: vec![],
+                max_trades: 1,
+                expires_in_blocks: 0,
+            },
+            &[coin(800_000, DENOM)],
+        )
+        .unwrap();
+
+    // Alice accepts — token #1 transfers to bob, alice receives funds
+    let alice_before = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptCollectionOffer {
+                offer_id: 1,
+                token_id: "1".into(),
+                proofs: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+    let alice_after = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+
+    // 1.5% fee on 800K = 12K; alice receives 800K - 12K = 788K
+    assert_eq!(alice_after - alice_before, Uint128::new(788_000));
+
+    // NFT now belongs to bob
+    let owner_resp: cw721::OwnerOfResponse = fx
+        .app
+        .wrap()
+        .query_wasm_smart(
+            &fx.crystal,
+            &cw721::Cw721QueryMsg::OwnerOf {
+                token_id: "1".into(),
+                include_expired: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(owner_resp.owner, "bob");
+
+    // Collection offer auto-closed
+    let res = fx.app.wrap().query_wasm_smart::<CollectionOffer>(
+        &fx.market,
+        &QueryMsg::CollectionOffer { offer_id: 1 },
+    );
+    assert!(res.is_err(), "offer should be removed after fill");
+}
+
+// ─── Inv 35 ─────────────────────────────────────────────────────────────────
+// Bulk offer survives partial fill, drains correctly, removes after final fill
+
+#[test]
+fn invariant_35_bulk_offer_partial_fill_then_complete() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    mint_crystal(&mut fx, "alice", "2");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "2", 1_000_000, 0).unwrap();
+
+    // Bob makes a bulk offer for 2 crystals at 500K each = 1M escrow
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: fx.crystal.to_string(),
+                price_per_nft: Uint128::new(500_000),
+                constraints: vec![],
+                max_trades: 2,
+                expires_in_blocks: 0,
+            },
+            &[coin(1_000_000, DENOM)],
+        )
+        .unwrap();
+
+    // First fill — token #1
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptCollectionOffer {
+                offer_id: 1,
+                token_id: "1".into(),
+                proofs: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Offer still exists with 1 fill remaining
+    let offer: CollectionOffer = fx
+        .app
+        .wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::CollectionOffer { offer_id: 1 })
+        .unwrap();
+    assert_eq!(offer.trades_filled, 1);
+    assert_eq!(offer.escrow_balance, Uint128::new(500_000));
+
+    // Second fill — token #2 → offer auto-closes
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptCollectionOffer {
+                offer_id: 1,
+                token_id: "2".into(),
+                proofs: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+
+    let res = fx.app.wrap().query_wasm_smart::<CollectionOffer>(
+        &fx.market,
+        &QueryMsg::CollectionOffer { offer_id: 1 },
+    );
+    assert!(res.is_err(), "offer should be removed after final fill");
+}
+
+// ─── Inv 36 ─────────────────────────────────────────────────────────────────
+// Trait-aware collection offer: valid merkle proof passes, wrong trait fails
+
+#[test]
+fn invariant_36_trait_constrained_offer_accepts_valid_proof_rejects_invalid() {
+    let mut fx = setup();
+    let crystal_addr = fx.crystal.to_string();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+
+    // Register single-leaf root for token "1" / Status / Unbroken
+    set_single_leaf_registry(&mut fx, &crystal_addr, "1", "Status", "Unbroken");
+
+    // Bob makes a trait-aware bulk offer ("Unbroken" only, max 1 fill)
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: crystal_addr.clone(),
+                price_per_nft: Uint128::new(800_000),
+                constraints: vec![TraitConstraint {
+                    trait_type: "Status".into(),
+                    accepted_values: vec!["Unbroken".into()],
+                }],
+                max_trades: 1,
+                expires_in_blocks: 0,
+            },
+            &[coin(800_000, DENOM)],
+        )
+        .unwrap();
+
+    // Wrong trait_value → fails
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptCollectionOffer {
+                offer_id: 1,
+                token_id: "1".into(),
+                proofs: vec![TraitProof {
+                    trait_type: "Status".into(),
+                    trait_value: "Broken".into(),     // not in accepted_values
+                    sibling_hashes_hex: vec![],
+                    sibling_on_right: vec![],
+                }],
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert_err(&err, "constraints");
+
+    // Correct proof → accepts (single-leaf root, no siblings needed)
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptCollectionOffer {
+                offer_id: 1,
+                token_id: "1".into(),
+                proofs: vec![TraitProof {
+                    trait_type: "Status".into(),
+                    trait_value: "Unbroken".into(),
+                    sibling_hashes_hex: vec![],
+                    sibling_on_right: vec![],
+                }],
+            },
+            &[],
+        )
+        .unwrap();
+}
+
+// ─── Inv 37 ─────────────────────────────────────────────────────────────────
+// Bad merkle proof against a real registry root → BadMerkleProof error
+
+#[test]
+fn invariant_37_bad_merkle_proof_rejected() {
+    let mut fx = setup();
+    let crystal_addr = fx.crystal.to_string();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+
+    // Registry says Status=Unbroken for token "1"
+    set_single_leaf_registry(&mut fx, &crystal_addr, "1", "Status", "Unbroken");
+
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeCollectionOffer {
+                nft_contract: crystal_addr.clone(),
+                price_per_nft: Uint128::new(500_000),
+                constraints: vec![TraitConstraint {
+                    trait_type: "Status".into(),
+                    accepted_values: vec!["Unbroken".into()],
+                }],
+                max_trades: 1,
+                expires_in_blocks: 0,
+            },
+            &[coin(500_000, DENOM)],
+        )
+        .unwrap();
+
+    // Submit wrong sibling hash (32 bytes of zeros) — single-leaf tree
+    // expected NO siblings, supplying any sibling poisons the root.
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptCollectionOffer {
+                offer_id: 1,
+                token_id: "1".into(),
+                proofs: vec![TraitProof {
+                    trait_type: "Status".into(),
+                    trait_value: "Unbroken".into(),
+                    sibling_hashes_hex: vec![hex32([0u8; 32])],
+                    sibling_on_right: vec![true],
+                }],
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert_err(&err, "Merkle proof failed");
 }

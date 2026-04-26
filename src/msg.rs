@@ -1,6 +1,9 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::Uint128;
-use crate::state::{Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo};
+use crate::state::{
+    CollectionOffer, Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
+    TraitConstraint, TraitRegistry,
+};
 
 // ═══════════════════════════════════════════
 // INSTANTIATE
@@ -111,6 +114,67 @@ pub enum ExecuteMsg {
 
     /// Transfer admin ownership.
     TransferOwnership { new_owner: String },
+
+    // ─── V1.3.0: Collection offers ──────────────────────────────────────
+
+    /// Make a collection offer paying with native tokens. The amount sent
+    /// MUST equal `price_per_nft * max_trades`.
+    /// • `constraints` empty + `max_trades=1` = simple "buy any token" offer
+    /// • `constraints` non-empty + `max_trades=1` = trait-filtered offer
+    /// • `max_trades>1` = bulk floor-defense (drains as sellers fill)
+    MakeCollectionOffer {
+        nft_contract: String,
+        price_per_nft: Uint128,
+        constraints: Vec<TraitConstraint>,
+        max_trades: u32,
+        expires_in_blocks: u64,
+    },
+
+    /// Seller fulfills (one slot of) a collection offer using a token they
+    /// have actively listed. Must supply a merkle proof per constraint
+    /// proving the token's traits satisfy the constraint (proofs MAY be
+    /// empty when constraints is empty).
+    AcceptCollectionOffer {
+        offer_id: u64,
+        token_id: String,
+        /// One proof per constraint. Each `TraitProof` proves the seller's
+        /// token has a trait_type=value that matches the constraint at the
+        /// same index in the offer's constraints vec.
+        proofs: Vec<TraitProof>,
+    },
+
+    /// Buyer cancels their own collection offer; remaining escrow refunded.
+    CancelCollectionOffer { offer_id: u64 },
+
+    /// Anyone can withdraw an expired collection offer (refund the buyer).
+    WithdrawExpiredCollectionOffer { offer_id: u64 },
+
+    /// Set/replace the trait registry for a collection (admin only in V1.3).
+    /// Pushing a new root invalidates outstanding proofs — UI should warn.
+    SetTraitRegistry {
+        nft_contract: String,
+        merkle_root_hex: String,    // 64 hex chars = 32 bytes
+        source_url: Option<String>,
+    },
+}
+
+/// Merkle proof entry submitted by seller at AcceptCollectionOffer time.
+/// Proves that token `(token_id from execute msg)` has trait
+/// `trait_type=trait_value` per the collection's trait registry.
+#[cw_serde]
+pub struct TraitProof {
+    /// Which trait this proof attests to (must match the constraint at the
+    /// same index in offer.constraints).
+    pub trait_type: String,
+    /// The value the seller is claiming for that trait (must be one of
+    /// the constraint.accepted_values).
+    pub trait_value: String,
+    /// Sibling hashes (32 bytes each) bottom-up. Hex-encoded for ergonomics.
+    pub sibling_hashes_hex: Vec<String>,
+    /// Per-level direction: true = sibling is on the right (we hash
+    /// hash(self || sibling)), false = sibling is on the left
+    /// (we hash hash(sibling || self)).
+    pub sibling_on_right: Vec<bool>,
 }
 
 /// Message embedded in CW721 SendNft callback
@@ -131,6 +195,15 @@ pub enum Cw20HookMsg {
     MakeOffer {
         nft_contract: String,
         token_id: String,
+        expires_in_blocks: u64,
+    },
+    /// V1.3: Make a collection offer paying with CW20 tokens.
+    /// Cw20.amount sent MUST equal price_per_nft * max_trades.
+    MakeCollectionOffer {
+        nft_contract: String,
+        price_per_nft: Uint128,
+        constraints: Vec<TraitConstraint>,
+        max_trades: u32,
         expires_in_blocks: u64,
     },
 }
@@ -203,6 +276,29 @@ pub enum QueryMsg {
     /// Current launch caps.
     #[returns(LaunchCaps)]
     LaunchCaps {},
+
+    // ─── V1.3.0: Collection offers + trait registry ─────────────────────
+
+    #[returns(CollectionOffer)]
+    CollectionOffer { offer_id: u64 },
+
+    #[returns(CollectionOffersResponse)]
+    CollectionOffersForCollection {
+        nft_contract: String,
+        start_after: Option<u64>,
+        limit: Option<u32>,
+    },
+
+    #[returns(CollectionOffersResponse)]
+    CollectionOffersByBuyer {
+        buyer: String,
+        start_after: Option<u64>,
+        limit: Option<u32>,
+    },
+
+    /// Returns the trait registry (merkle root) for a collection.
+    #[returns(TraitRegistryResponse)]
+    TraitRegistry { nft_contract: String },
 }
 
 // ═══════════════════════════════════════════
@@ -257,4 +353,16 @@ pub struct CollectionStatsResponse {
     pub active_listings: u32,
     pub cap: u32,
     pub allowed: bool,
+}
+
+// ─── V1.3.0 responses ──────────────────────────────────────────────────
+
+#[cw_serde]
+pub struct CollectionOffersResponse {
+    pub offers: Vec<CollectionOffer>,
+}
+
+#[cw_serde]
+pub struct TraitRegistryResponse {
+    pub registry: Option<TraitRegistry>,
 }
