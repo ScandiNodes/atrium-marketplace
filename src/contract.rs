@@ -30,19 +30,30 @@ const MAX_ROYALTY_BPS: u16 = 1500; // 15%
 const MAX_FEE_BPS: u16 = 500; // 5%
 
 // ═══════════════════════════════════════════
-// MIGRATE — V1.0 → V1.1 (tier ladder)
+// MIGRATE — V1.0 → V1.1 (tier ladder) → V1.2 (Cosmic-only)
 // ═══════════════════════════════════════════
 //
-// V1.1.0 changes:
+// V1.2.0 changes (2026-04-26, Daniel):
+//   • Tier ladder collapsed — only "cosmic" gets a discount.
+//   • All other tiers (prismatic/radiant/charged/raw) AND non-holders
+//     pay config.fee_bps (default 1.5%, will bump to 5.0% after operator
+//     notice to existing sellers — see plan_atrium_v1_2_post_migrate.md).
+//   • highest_crystal_tier() unchanged — still surfaces highest tier
+//     name for FeeInfoResponse so UI can show "you own a Charged
+//     Crystal" badges, even though only Cosmic gets fee discount.
+//
+// V1.1.0 changes (deprecated, kept for code archaeology):
 //   • Crystal-holder discount split into a 5-rung tier ladder
 //     (Cosmic 0% / Prismatic 0.25% / Radiant 0.50% / Charged 1.0% / Raw 1.5%)
 //   • Resolution chain: ALTAR → FUSION → MINT (hardcoded mainnet addrs)
 //   • Up to 30 Crystals scanned per buyer to bound gas
 //   • FeeInfoResponse extended with `crystal_tier: Option<String>`
 //
-// No state changes — same Config, same Listings, same Offers. The migrate
-// function only updates the contract version marker and is otherwise a
-// no-op. cw2 stores the new version on-chain so external indexers know.
+// No state changes in any migration — same Config, same Listings, same
+// Offers. migrate() only updates the cw2 contract version marker so
+// external indexers know which version is running. fee_bps is changed
+// separately via execute_update_config (NOT in migrate) to keep the
+// in-flight-listing-impact decision in operator hands.
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
@@ -1199,33 +1210,30 @@ fn decrement_offers_per_nft(
 
 /// Calculate effective fee bps for a buyer.
 ///
-/// Priority:
-/// 1. **Crystal holder (any tier)** → 0 bps (free trades for the founding tribe)
-/// 2. **CAPA staker** → tier-based discount (25 / 50 / 75 bps off)
-/// 3. **Else** → base fee_bps
+/// V1.2.0 (Cosmic-only model — Daniel 2026-04-26):
 ///
-/// V1.1.0 (Alt D — Cosmic-only 0% + tier ladder):
+///   Cosmic Crystal → 0 bps   (free trading; top-tier perk, ~50 wallets)
+///   Everyone else  → fee_bps (default 500 / 5.00%)
 ///
-///   Cosmic       → 0   bps  (free for top-tier holders, ~50 wallets)
-///   Prismatic    → 25  bps  (0.25%)
-///   Radiant      → 50  bps  (0.50%)
-///   Charged      → 100 bps  (1.00%)
-///   Raw / none   → fee_bps  (1.50% default, no discount)
+/// Replaces V1.1.0's 5-rung ladder. Rationale: a tiered ladder dilutes the
+/// Cosmic premium and gives small discounts that nobody really values
+/// (operator-feedback 2026-04-26). A single sharp cliff between Cosmic
+/// (true free trading) and everyone-else (5%) makes Cosmic genuinely the
+/// apex perk and keeps marketplace economics intact.
 ///
-/// Tier resolution walks ALTAR → FUSION → MINT contracts (mirrors
+/// Tier resolution still walks ALTAR → FUSION → MINT contracts (mirrors
 /// `feedback_crystal_tier_resolution.md` — ascended/fused crystals
 /// aren't in MINT). Up to TIER_QUERY_LIMIT crystals checked per buyer
 /// to bound gas. Cosmic short-circuits the loop since it's the top.
+///
+/// `highest_crystal_tier` still returns the highest owned tier name so
+/// FeeInfoResponse can surface it for UI badges, but only "cosmic" gets
+/// the discount.
 fn get_effective_fee(deps: Deps, config: &Config, buyer: &Addr) -> StdResult<u16> {
-    // Tier-based ladder
+    // Cosmic-only discount
     let highest = highest_crystal_tier(deps, buyer)?;
-    match highest.as_deref() {
-        Some("cosmic")    => return Ok(0),
-        Some("prismatic") => return Ok(25),
-        Some("radiant")   => return Ok(50),
-        Some("charged")   => return Ok(100),
-        // Raw or no Crystal falls through to base fee
-        _ => {}
+    if matches!(highest.as_deref(), Some("cosmic")) {
+        return Ok(0);
     }
 
     // CAPA-staker discount (TODO: integrate when capa_gov_contract is set)

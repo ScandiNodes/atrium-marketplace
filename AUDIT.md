@@ -1,6 +1,73 @@
-# Atrium Marketplace — Internal Audit (v1.1.0-rc1)
+# Atrium Marketplace — Internal Audit (v1.2.0-rc1)
 
-## V1.1.0 — Crystal tier ladder ("Alt D")
+## V1.2.0 — Cosmic-only discount + 5% base fee (Daniel 2026-04-26)
+
+Replaces V1.1.0's 5-rung Crystal tier ladder with a single sharp cliff:
+
+| Buyer profile | fee_bps | Effective rate |
+|---|---|---|
+| Cosmic Crystal-holder | 0 | 0.00% (free) |
+| Everyone else (incl. other Crystal tiers, no Crystal) | 500 | 5.00% (default) |
+
+**Rationale:** Operator feedback (Scandalous-collection holder, 2026-04-26)
+flagged that scaled discounts dilute the Cosmic premium and give discounts
+nobody really values. Single sharp cliff makes Cosmic the apex perk and
+keeps marketplace economics intact at modern marketplace fee-rates.
+
+**Code change:**
+```rust
+fn get_effective_fee(deps: Deps, config: &Config, buyer: &Addr) -> StdResult<u16> {
+    let highest = highest_crystal_tier(deps, buyer)?;
+    if matches!(highest.as_deref(), Some("cosmic")) {
+        return Ok(0);
+    }
+    Ok(config.fee_bps)  // 500 bps post update_config
+}
+```
+
+`highest_crystal_tier` is unchanged — still surfaces highest tier for
+FeeInfoResponse.crystal_tier so UI can show "you own a Charged Crystal"
+badges (informational only — no fee discount).
+
+**Migration phoenix-1:**
+| | Värde |
+|---|---|
+| Wasm sha256 | `aa673620d8bbefcd3329ce619b8e3ec67eff0e43f83c012a74fda85131432bcc` |
+| Wasm storlek | 374 KB |
+| Optimizer | `cosmwasm/optimizer:0.16.0` |
+| Store-tx | `1D59E97EFF0C13FD71CCE120591E84A14942DC9F29AA61D9A64063C41CC4D888` (h. 20724768) |
+| Migrate-tx | `B0A7578A5FA88ED75A5758B180B8EC7D9BA1044C85DD81AFD2149C1F8224B34D` (h. 20724777) |
+| update_config fee_bps | `E77F5533722EDA14CD9E84A8808D18458CF34D16471D906DE4DB72E8CC21A06E` (h. 20724785) |
+| update_config treasury_share_bps | `FD6457E713249B33FA363F96D25F16C2AE4563460BBAD9B37620673370229452` (h. 20724792) |
+| Old code_id | 3849 |
+| New code_id | **3850** |
+| Contract | `terra15du229lqcxkn939pmjgklqunftf604q4wz87kt5awj6reghec5jqs0w0kj` (oförändrad) |
+| New fee_bps | **500 (5.00%)** |
+| New treasury_share_bps | **333** (preserves ~2/3 split) |
+| Migrate signer | `atrium-admin` (`terra1ef4g5x...`) — NOTE: peg-bot is NOT contract-admin |
+
+**On-chain verification post-migrate (V1.2.0):**
+
+| Wallet | Tier | fee_bps | discount_bps |
+|---|---|---|---|
+| `terra1cqc26l...` (val-key) | cosmic | 0 | 500 |
+| `terra18hhej6...` (peg-bot) | radiant | 500 | 0 |
+| anonymous (no Crystal) | None | 500 | 0 |
+
+**In-flight listing-impact (acknowledged, accepted by operator):**
+4 active listings at migrate time (#4 peg-bot 30 SOLID + #5/#6/#7 Scandalous
+20 SOLID each). All listed under V1.1 fee_bps=150 expectations. After
+fee_bps→500, sellers receive 95% net instead of 98.5%. Total max impact
+across all 4 if sold immediately: ~3.15 SOLID (~$3 at $1/SOLID). Decision
+documented in `audit F-06` (royalty-change-affects-in-flight) parent
+finding — same admin-trust-bounded class.
+
+**State preservation:** No Config-field schema changes. Same Listings,
+Offers, Royalties, allowlist, caps. cw2 contract version updated.
+
+---
+
+## V1.1.0 — Crystal tier ladder ("Alt D") [DEPRECATED]
 
 Replaces V1.0's binary 0% / 1.5% Crystal-holder check with a 5-rung ladder
 based on the buyer's HIGHEST owned Crystal tier:

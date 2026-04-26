@@ -1,8 +1,8 @@
 [package]
 name = "atrium-marketplace"
-version = "1.1.0-rc1"
+version = "1.2.0-rc1"
 edition = "2021"
-description = "Atrium NFT marketplace contract for Solid — 0% fees for CAPA Crystal holders"
+description = "Atrium NFT marketplace contract for Solid — 0% fees for Cosmic Crystal holders"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
