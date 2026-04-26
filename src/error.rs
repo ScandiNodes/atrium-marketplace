@@ -157,4 +157,50 @@ pub enum ContractError {
     /// buyer at accept-time) is not the whitelisted address.
     #[error("This listing is private — only {whitelisted} can buy it")]
     ListingPrivate { whitelisted: String },
+
+    // ─── V1.5.0: Vesting (TLA-Lock) + promo whitelist ────────────────────
+
+    /// Release{} called before the unlock height was reached.
+    #[error("Vesting period not over — releases at block {unlock_at} (current {current})")]
+    LockNotExpired { unlock_at: u64, current: u64 },
+
+    /// Release{} called on a listing that hasn't been bought yet, or on a
+    /// non-vesting listing.
+    #[error("Listing is not in vesting/locked state")]
+    NotInLockedState {},
+
+    /// Cancel/AcceptOffer on a listing that's already in locked state
+    /// (post-buy, awaiting release). Seller already received payment;
+    /// can't unwind.
+    #[error("Listing is locked (already bought, awaiting release) — cannot modify")]
+    ListingLocked {},
+
+    /// Vesting duration exceeds the cap. Cap = ~1.9 years on Terra2 6s blocks.
+    #[error("Vesting duration too long: max {cap} blocks (~1.9 years)")]
+    TimeLockTooLong { cap: u64 },
+
+    /// Whitelist size > MAX_WHITELIST_SLOTS.
+    #[error("Whitelist too large: max {cap} entries")]
+    WhitelistTooLarge { cap: u32 },
+
+    /// Whitelist provided but with zero entries.
+    #[error("Whitelist must have at least one entry — leave it None for an open listing")]
+    WhitelistEmpty {},
+
+    /// Whitelist entry is malformed: max_buys=0 or duplicate address.
+    #[error("Invalid whitelist entry: max_buys must be ≥1 and addresses unique")]
+    WhitelistInvalidEntry {},
+
+    /// Caller tried to set BOTH whitelisted_buyer (V1.4 single-private) AND
+    /// whitelist (V1.5 multi-address). Mutually exclusive — pick one.
+    #[error("Set whitelisted_buyer OR whitelist — never both")]
+    WhitelistAndPrivateConflict {},
+
+    /// Buyer (or accepted offer's buyer) is not in the listing's whitelist.
+    #[error("Your wallet is not on this listing's whitelist")]
+    NotInWhitelist {},
+
+    /// Buyer is on the whitelist but their slot is already exhausted.
+    #[error("Your whitelist slot is exhausted")]
+    WhitelistSlotExhausted {},
 }

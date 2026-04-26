@@ -156,6 +156,13 @@ pub enum ExecuteMsg {
         merkle_root_hex: String,    // 64 hex chars = 32 bytes
         source_url: Option<String>,
     },
+
+    // ─── V1.5.0: Vesting (TLA-Lock) release ──────────────────────────────
+
+    /// Release the escrowed NFT to the locked_for buyer. Permissionless —
+    /// anyone may call once `block.height >= listing.time_locked_until`.
+    /// Errors if listing isn't in locked state, or unlock height not reached.
+    Release { listing_id: u64 },
 }
 
 /// Merkle proof entry submitted by seller at AcceptCollectionOffer time.
@@ -188,8 +195,33 @@ pub struct ListNftMsg {
     /// an Offer from this wallet can be AcceptedOffer'd by the seller.
     /// Use for OTC / peer-to-peer private sales. None = open listing.
     /// Defaults to None for backwards compatibility with V1.3 frontends.
+    /// Mutually exclusive with V1.5's `whitelist` (validated at list-time).
     #[serde(default)]
     pub whitelisted_buyer: Option<String>,
+
+    /// V1.5.0: optional vesting (TLA-Lock) duration in BLOCKS from
+    /// list-time. The contract converts to absolute height
+    /// (`time_locked_until = list_block + lock_in_blocks`). When set,
+    /// BuyNft pays the seller immediately but escrows the NFT until
+    /// `Release{}` is called after the unlock height. None = atomic.
+    /// Hard-capped by MAX_TIME_LOCK_BLOCKS.
+    #[serde(default)]
+    pub lock_in_blocks: Option<u64>,
+
+    /// V1.5.0: optional multi-address whitelist with consumable slots.
+    /// Each entry = (address, max_buys). Atomic-validated at list-time:
+    /// no duplicates, all max_buys ≥ 1, total entries ≤ MAX_WHITELIST_SLOTS.
+    /// Mutually exclusive with `whitelisted_buyer`.
+    #[serde(default)]
+    pub whitelist: Option<Vec<WhitelistEntry>>,
+}
+
+/// V1.5.0: Input form for a whitelist slot. Address is a String here
+/// (validated to terra1… at list-time) and stored as Addr in WhitelistSlot.
+#[cw_serde]
+pub struct WhitelistEntry {
+    pub addr: String,
+    pub max_buys: u32,
 }
 
 /// Message embedded in CW20 Send callback

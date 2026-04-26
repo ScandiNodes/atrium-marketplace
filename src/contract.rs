@@ -13,14 +13,16 @@ use crate::msg::{
     AllowedCollectionsResponse, CollectionOffersResponse, CollectionStatsResponse, Cw20HookMsg,
     ExecuteMsg, FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg, ListingsResponse,
     MigrateMsg, OffersResponse, QueryMsg, RoyaltyInfoResponse, TraitProof, TraitRegistryResponse,
+    WhitelistEntry,
 };
 use crate::state::{
     CollectionOffer, Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
-    TraitConstraint, TraitRegistry,
+    TraitConstraint, TraitRegistry, WhitelistSlot,
     ACTIVE_LISTING, ACTIVE_LISTINGS_PER_COLLECTION, ACTIVE_OFFERS_PER_NFT,
     ALLOWED_COLLECTIONS, COLLECTION_OFFERS, COLLECTION_OFFER_COUNT,
     COLLECTION_OFFERS_BY_COLLECTION, CONFIG, CRYSTAL_NFT_CONTRACT, FEE_DISCOUNT_TIERS,
-    LAUNCH_CAPS, LISTING_COUNT, LISTINGS, MAX_MERKLE_DEPTH, MAX_TRADES_PER_OFFER,
+    LAUNCH_CAPS, LISTING_COUNT, LISTINGS, MAX_MERKLE_DEPTH, MAX_TIME_LOCK_BLOCKS,
+    MAX_TRADES_PER_OFFER, MAX_WHITELIST_SLOTS,
     OFFER_COUNT, OFFERS, OFFERS_BY_NFT, ROYALTIES, TRAIT_REGISTRY,
 };
 
@@ -211,6 +213,7 @@ pub fn execute(
             merkle_root_hex,
             source_url,
         } => execute_set_trait_registry(deps, env, info, nft_contract, merkle_root_hex, source_url),
+        ExecuteMsg::Release { listing_id } => execute_release(deps, env, info, listing_id),
     }
 }
 
@@ -284,6 +287,39 @@ fn execute_receive_nft(
         _ => None,
     };
 
+    // V1.5.0: optional vesting (TLA-Lock) — validate cap + convert relative
+    // lock_in_blocks to absolute time_locked_until (env.block.height-based).
+    let time_locked_until = match list_msg.lock_in_blocks {
+        Some(n) if n > 0 => {
+            if n > MAX_TIME_LOCK_BLOCKS {
+                return Err(ContractError::TimeLockTooLong {
+                    cap: MAX_TIME_LOCK_BLOCKS,
+                });
+            }
+            Some(env.block.height + n)
+        }
+        _ => None,
+    };
+
+    // V1.5.0: optional promo whitelist — validate non-empty, dedup,
+    // bounds-check, no zero-quota entries. Mutually exclusive with
+    // V1.4 whitelisted_buyer.
+    let whitelist = match &list_msg.whitelist {
+        Some(entries) if !entries.is_empty() => {
+            if whitelisted_buyer.is_some() {
+                return Err(ContractError::WhitelistAndPrivateConflict {});
+            }
+            if entries.len() > MAX_WHITELIST_SLOTS as usize {
+                return Err(ContractError::WhitelistTooLarge {
+                    cap: MAX_WHITELIST_SLOTS,
+                });
+            }
+            Some(validate_whitelist_entries(deps.as_ref(), entries)?)
+        }
+        Some(_) => return Err(ContractError::WhitelistEmpty {}),
+        None => None,
+    };
+
     let listing = Listing {
         id,
         seller: seller.clone(),
@@ -294,6 +330,9 @@ fn execute_receive_nft(
         expires_at,
         created_at: env.block.height,
         whitelisted_buyer,
+        time_locked_until,
+        locked_for: None,
+        whitelist,
     };
 
     LISTINGS.save(deps.storage, id, &listing)?;
@@ -317,7 +356,78 @@ fn execute_receive_nft(
     if let Some(wb) = &listing.whitelisted_buyer {
         resp = resp.add_attribute("whitelisted_buyer", wb.as_str());
     }
+    // V1.5: surface vesting unlock + whitelist size for indexers.
+    if let Some(unlock) = listing.time_locked_until {
+        resp = resp.add_attribute("time_locked_until", unlock.to_string());
+    }
+    if let Some(wl) = &listing.whitelist {
+        resp = resp.add_attribute("whitelist_size", wl.len().to_string());
+    }
     Ok(resp)
+}
+
+// ─── V1.5.0: Whitelist validation helper ───────────────────────────────
+//
+// Called only at list-time (cold path). Validates:
+//   • Every WhitelistEntry has max_buys ≥ 1
+//   • Every address parses as a valid terra1… bech32
+//   • No duplicate addresses (collision would make slot-decrement ambiguous)
+//
+// Returns the canonicalised Vec<WhitelistSlot> ready for storage. O(n²)
+// duplicate check is fine because n ≤ MAX_WHITELIST_SLOTS = 100.
+fn validate_whitelist_entries(
+    deps: Deps,
+    entries: &[WhitelistEntry],
+) -> Result<Vec<WhitelistSlot>, ContractError> {
+    let mut out: Vec<WhitelistSlot> = Vec::with_capacity(entries.len());
+    for e in entries {
+        if e.max_buys == 0 {
+            return Err(ContractError::WhitelistInvalidEntry {});
+        }
+        let addr = deps.api.addr_validate(&e.addr)
+            .map_err(|_| ContractError::WhitelistInvalidEntry {})?;
+        if out.iter().any(|s| s.addr == addr) {
+            return Err(ContractError::WhitelistInvalidEntry {});
+        }
+        out.push(WhitelistSlot { addr, remaining: e.max_buys });
+    }
+    Ok(out)
+}
+
+// ─── V1.5.0: Whitelist consumption helper ─────────────────────────────
+//
+// Called at buy-time / accept-time. If the listing has a whitelist,
+// verifies the buyer has a non-zero slot, decrements it, and prunes
+// zero-slots from the list. Returns Ok(()) when no whitelist OR when
+// successfully consumed; errors otherwise. Caller must save the
+// listing afterwards.
+fn consume_whitelist_slot(
+    listing: &mut Listing,
+    buyer: &Addr,
+) -> Result<(), ContractError> {
+    let whitelist = match &mut listing.whitelist {
+        Some(w) => w,
+        None => return Ok(()),  // not a whitelist listing — nothing to do
+    };
+    let idx = whitelist
+        .iter()
+        .position(|s| &s.addr == buyer)
+        .ok_or(ContractError::NotInWhitelist {})?;
+    if whitelist[idx].remaining == 0 {
+        return Err(ContractError::WhitelistSlotExhausted {});
+    }
+    whitelist[idx].remaining -= 1;
+    if whitelist[idx].remaining == 0 {
+        whitelist.remove(idx);
+    }
+    // If we just consumed the last slot, drop the whole field so the
+    // listing reads as "open" again (it isn't, since whitelist=[] is
+    // semantically equal to "nobody can buy" but the seller can still
+    // CancelListing). Keeping it as Some(empty Vec) would be misleading.
+    if whitelist.is_empty() {
+        listing.whitelist = None;
+    }
+    Ok(())
 }
 
 // ───── CW20 Receive: Buy or Offer ─────
@@ -385,13 +495,19 @@ fn execute_buy_native(
         return Err(ContractError::MultiDenomSend {});
     }
 
-    let listing = LISTINGS
+    let mut listing = LISTINGS
         .may_load(deps.storage, listing_id)?
         .ok_or(ContractError::ListingNotFound { id: listing_id })?;
 
     // AUDIT FIX: >= for inclusive expiry boundary
     if listing.expires_at > 0 && env.block.height >= listing.expires_at {
         return Err(ContractError::ListingExpired {});
+    }
+
+    // V1.5: listing already in vesting/locked state — buyer paid
+    // earlier, NFT awaits Release{}. No new buys accepted.
+    if listing.locked_for.is_some() {
+        return Err(ContractError::ListingLocked {});
     }
 
     // Verify not self-purchase
@@ -408,6 +524,11 @@ fn execute_buy_native(
             });
         }
     }
+
+    // V1.5: promo whitelist gate (consumes a slot atomically when
+    // present). Mutually exclusive with whitelisted_buyer (validated
+    // at list-time), so reaching here when both are set is impossible.
+    consume_whitelist_slot(&mut listing, &info.sender)?;
 
     // Verify payment type is native
     let expected_denom = match &listing.payment {
@@ -435,14 +556,8 @@ fn execute_buy_native(
         });
     }
 
-    // Execute the sale
-    execute_sale(
-        deps,
-        &info.sender,
-        &listing,
-        paid,
-        &listing.payment.clone(),
-    )
+    let payment = listing.payment.clone();
+    execute_sale(deps, env, &info.sender, listing, paid, &payment)
 }
 
 // ───── Buy with CW20 tokens ─────
@@ -465,7 +580,7 @@ fn execute_buy_cw20(
             .add_attribute("reason", "paused"));
     }
 
-    let listing = match LISTINGS.may_load(deps.storage, listing_id)? {
+    let mut listing = match LISTINGS.may_load(deps.storage, listing_id)? {
         Some(l) => l,
         None => {
             return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
@@ -481,6 +596,13 @@ fn execute_buy_cw20(
             .add_attribute("reason", "listing_expired"));
     }
 
+    // V1.5: locked listings reject new buys (refund-path).
+    if listing.locked_for.is_some() {
+        return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
+            .add_attribute("action", "buy_nft_refund")
+            .add_attribute("reason", "listing_locked"));
+    }
+
     if buyer == listing.seller {
         return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
             .add_attribute("action", "buy_nft_refund")
@@ -494,6 +616,21 @@ fn execute_buy_cw20(
             return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
                 .add_attribute("action", "buy_nft_refund")
                 .add_attribute("reason", "listing_private"));
+        }
+    }
+
+    // V1.5: promo whitelist gate. CW20 path refunds on failure (matches
+    // V1.4 pattern — funds already arrived via Receive, can't reject).
+    if listing.whitelist.is_some() {
+        if let Err(e) = consume_whitelist_slot(&mut listing, &buyer) {
+            let reason = match e {
+                ContractError::NotInWhitelist {} => "not_in_whitelist",
+                ContractError::WhitelistSlotExhausted {} => "whitelist_exhausted",
+                _ => "whitelist_error",
+            };
+            return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
+                .add_attribute("action", "buy_nft_refund")
+                .add_attribute("reason", reason));
         }
     }
 
@@ -520,15 +657,28 @@ fn execute_buy_cw20(
             .add_attribute("reason", "wrong_amount"));
     }
 
-    execute_sale(deps, &buyer, &listing, amount, &listing.payment.clone())
+    let payment = listing.payment.clone();
+    execute_sale(deps, env, &buyer, listing, amount, &payment)
 }
 
 // ───── Core sale logic (shared by native + CW20 buys) ─────
+//
+// V1.5.0: takes owned `Listing` + Env so it can branch on the
+// vesting (TLA-Lock) path. Pre-V1.5 this was `&Listing` borrow + no
+// Env — kept the same routing logic, just extended persistence.
+//
+// • Atomic path (no time-lock OR unlock height already reached):
+//   payments routed → NFT transferred → listing removed.
+// • Vesting path (time_locked_until > current block):
+//   payments routed → NFT STAYS in marketplace escrow → listing
+//   saved with `locked_for = Some(buyer)`. `Release{}` later moves
+//   the NFT once unlock height hit.
 
 fn execute_sale(
     deps: DepsMut,
+    env: Env,
     buyer: &Addr,
-    listing: &Listing,
+    mut listing: Listing,
     paid: Uint128,
     payment: &PaymentType,
 ) -> Result<Response, ContractError> {
@@ -662,7 +812,43 @@ fn execute_sale(
         }
     }
 
-    // Transfer NFT to buyer
+    // V1.5.0 vesting branch — only ATOMIC path transfers NFT + removes
+    // listing. Vesting path keeps NFT escrowed and saves listing with
+    // `locked_for` populated so a future `Release{}` can ship the NFT.
+    let is_vesting = matches!(
+        listing.time_locked_until,
+        Some(unlock) if env.block.height < unlock
+    );
+
+    if is_vesting {
+        // VESTING PATH: payments routed (above), NFT held in escrow.
+        // Mark listing as locked-for the buyer; persist updated state
+        // (also persists any whitelist-slot consumption done by caller
+        // before reaching execute_sale).
+        listing.locked_for = Some(buyer.clone());
+        let unlock_at = listing.time_locked_until.unwrap();
+        LISTINGS.save(deps.storage, listing.id, &listing)?;
+        // Note: ACTIVE_LISTING + collection counters STAY in place —
+        // the listing still exists, just gated to Release{}.
+
+        return Ok(Response::new()
+            .add_messages(messages)
+            .add_attribute("action", "buy_nft")
+            .add_attribute("listing_id", listing.id.to_string())
+            .add_attribute("buyer", buyer)
+            .add_attribute("seller", &listing.seller)
+            .add_attribute("nft_contract", &listing.nft_contract)
+            .add_attribute("token_id", &listing.token_id)
+            .add_attribute("price", sale_price)
+            .add_attribute("fee", fee_amount)
+            .add_attribute("effective_fee_bps", effective_fee_bps.to_string())
+            .add_attribute("royalty", royalty_amount)
+            .add_attribute("seller_receives", seller_amount)
+            .add_attribute("vesting_locked_for", buyer.as_str())
+            .add_attribute("vesting_unlock_at", unlock_at.to_string()))
+    }
+
+    // ATOMIC PATH (V1.0 default): transfer NFT + remove listing.
     messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
         contract_addr: listing.nft_contract.to_string(),
         msg: to_json_binary(&cw721::Cw721ExecuteMsg::TransferNft {
@@ -672,7 +858,6 @@ fn execute_sale(
         funds: vec![],
     }));
 
-    // Remove listing + decrement collection counter
     LISTINGS.remove(deps.storage, listing.id);
     ACTIVE_LISTING.remove(
         deps.storage,
@@ -705,6 +890,14 @@ fn execute_cancel_listing(
     let listing = LISTINGS
         .may_load(deps.storage, listing_id)?
         .ok_or(ContractError::ListingNotFound { id: listing_id })?;
+
+    // V1.5: locked listings can't be cancelled — buyer already paid +
+    // payments routed; only `Release{}` advances the listing now.
+    // Operator-recovery path: admin can `Release{}` once the unlock
+    // height is reached (Release is permissionless after that).
+    if listing.locked_for.is_some() {
+        return Err(ContractError::ListingLocked {});
+    }
 
     // Only seller or contract owner can cancel
     let config = CONFIG.load(deps.storage)?;
@@ -917,10 +1110,15 @@ fn execute_accept_offer(
         )?
         .ok_or(ContractError::NoActiveListing {})?;
 
-    let listing = LISTINGS.load(deps.storage, listing_id)?;
+    let mut listing = LISTINGS.load(deps.storage, listing_id)?;
 
     if info.sender != listing.seller {
         return Err(ContractError::NotSeller {});
+    }
+
+    // V1.5: locked listings can't take new accepts.
+    if listing.locked_for.is_some() {
+        return Err(ContractError::ListingLocked {});
     }
 
     // V1.4: private-listing gate also applies on accept-offer. The seller
@@ -934,6 +1132,10 @@ fn execute_accept_offer(
             });
         }
     }
+
+    // V1.5: promo whitelist gate. Offer.buyer must be in the whitelist
+    // with a non-zero slot — same semantics as direct BuyNft.
+    consume_whitelist_slot(&mut listing, &offer.buyer)?;
 
     // AUDIT FIX: Validate offer payment type matches listing payment type
     match (&listing.payment, &offer.payment) {
@@ -956,7 +1158,8 @@ fn execute_accept_offer(
     decrement_offers_per_nft(deps.storage, offer.nft_contract.as_str(), offer.token_id.as_str())?;
 
     // Execute the sale using offer's payment and price
-    let result = execute_sale(deps, &offer.buyer, &listing, offer.price, &offer.payment)?;
+    let payment = offer.payment.clone();
+    let result = execute_sale(deps, env, &offer.buyer, listing, offer.price, &payment)?;
 
     Ok(result.add_attribute("accepted_offer_id", offer_id.to_string()))
 }
@@ -1974,9 +2177,13 @@ fn execute_accept_collection_offer(
     let listing_id = ACTIVE_LISTING
         .may_load(deps.storage, (offer.nft_contract.as_str(), token_id.as_str()))?
         .ok_or(ContractError::NotListedBySeller {})?;
-    let listing = LISTINGS.load(deps.storage, listing_id)?;
+    let mut listing = LISTINGS.load(deps.storage, listing_id)?;
     if info.sender != listing.seller {
         return Err(ContractError::NotListedBySeller {});
+    }
+    // V1.5: locked listings can't satisfy collection offers (already bought).
+    if listing.locked_for.is_some() {
+        return Err(ContractError::ListingLocked {});
     }
     // V1.4: if seller marked their listing as private to wallet X, they
     // can only fulfil collection offers WHOSE BUYER IS X. Otherwise the
@@ -1989,6 +2196,8 @@ fn execute_accept_collection_offer(
             });
         }
     }
+    // V1.5: promo whitelist gate also applies to collection-offer fills.
+    consume_whitelist_slot(&mut listing, &offer.buyer)?;
     match (&listing.payment, &offer.payment) {
         (PaymentType::Native { denom: d1 }, PaymentType::Native { denom: d2 }) if d1 == d2 => {}
         (PaymentType::Cw20 { contract_addr: c1 }, PaymentType::Cw20 { contract_addr: c2 })
@@ -2053,7 +2262,8 @@ fn execute_accept_collection_offer(
 
     // Execute the sale at price_per_nft (NOT listing.price — collection
     // offer dictates).
-    let result = execute_sale(deps, &offer.buyer, &listing, offer.price_per_nft, &offer.payment)?;
+    let payment = offer.payment.clone();
+    let result = execute_sale(deps, env, &offer.buyer, listing, offer.price_per_nft, &payment)?;
     Ok(result.add_attribute("accepted_collection_offer_id", offer_id.to_string()))
 }
 
@@ -2131,6 +2341,72 @@ fn refund_collection_offer_and_close(
         .add_attribute("offer_id", offer.id.to_string())
         .add_attribute("buyer", offer.buyer)
         .add_attribute("refunded", refund_amount))
+}
+
+// ─── Execute: Release (V1.5.0 vesting / TLA-Lock) ────────────────────────
+//
+// Permissionless trigger that ships the escrowed NFT to the buyer who
+// paid earlier, once the unlock height has been reached.
+//
+// Why permissionless: the buyer is the obvious caller (they want their
+// NFT) but anyone can trigger — useful when buyer is offline, or when
+// a project sets a calendar-aligned unlock and a watcher-bot fires it
+// at the right block to make the UX seamless.
+//
+// Errors:
+//   • ListingNotFound — wrong id or already released
+//   • NotInLockedState — listing isn't in vesting/locked phase
+//   • LockNotExpired — too early
+//
+// Effects:
+//   • cw721 TransferNft → listing.locked_for
+//   • LISTINGS.remove + ACTIVE_LISTING.remove + collection counter --
+
+fn execute_release(
+    deps: DepsMut,
+    env: Env,
+    _info: MessageInfo,
+    listing_id: u64,
+) -> Result<Response, ContractError> {
+    let listing = LISTINGS
+        .may_load(deps.storage, listing_id)?
+        .ok_or(ContractError::ListingNotFound { id: listing_id })?;
+
+    let buyer = listing.locked_for.clone()
+        .ok_or(ContractError::NotInLockedState {})?;
+    let unlock_at = listing.time_locked_until
+        .ok_or(ContractError::NotInLockedState {})?;
+
+    if env.block.height < unlock_at {
+        return Err(ContractError::LockNotExpired {
+            unlock_at,
+            current: env.block.height,
+        });
+    }
+
+    let transfer_msg = CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: listing.nft_contract.to_string(),
+        msg: to_json_binary(&cw721::Cw721ExecuteMsg::TransferNft {
+            recipient: buyer.to_string(),
+            token_id: listing.token_id.clone(),
+        })?,
+        funds: vec![],
+    });
+
+    LISTINGS.remove(deps.storage, listing_id);
+    ACTIVE_LISTING.remove(
+        deps.storage,
+        (listing.nft_contract.as_str(), listing.token_id.as_str()),
+    );
+    decrement_collection_listings(deps.storage, listing.nft_contract.as_str())?;
+
+    Ok(Response::new()
+        .add_message(transfer_msg)
+        .add_attribute("action", "release")
+        .add_attribute("listing_id", listing_id.to_string())
+        .add_attribute("buyer", buyer)
+        .add_attribute("nft_contract", listing.nft_contract)
+        .add_attribute("token_id", listing.token_id))
 }
 
 // ─── Execute: SetTraitRegistry ───────────────────────────────────────────

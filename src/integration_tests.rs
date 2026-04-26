@@ -257,6 +257,8 @@ fn list_nft_native(
         },
         expires_in_blocks,
     whitelisted_buyer: None,
+        lock_in_blocks: None,
+        whitelist: None,
     };
     let market = fx.market.to_string();
     let coll_addr = match collection {
@@ -293,6 +295,8 @@ fn list_nft_cw20(
         },
         expires_in_blocks,
     whitelisted_buyer: None,
+        lock_in_blocks: None,
+        whitelist: None,
     };
     let market = fx.market.to_string();
     let coll_addr = match collection {
@@ -1772,6 +1776,8 @@ fn list_nft_native_private(
         payment: PaymentType::Native { denom: DENOM.into() },
         expires_in_blocks: 0,
         whitelisted_buyer: Some(whitelisted_buyer.into()),
+        lock_in_blocks: None,
+        whitelist: None,
     };
     let market = fx.market.to_string();
     let coll_addr = match collection {
@@ -1923,6 +1929,8 @@ fn invariant_41_private_listing_cw20_path_refunds_non_whitelisted() {
         payment: PaymentType::Cw20 { contract_addr: capa.to_string() },
         expires_in_blocks: 0,
         whitelisted_buyer: Some("bob".into()),
+        lock_in_blocks: None,
+        whitelist: None,
     };
     let market = fx.market.to_string();
     fx.app
@@ -1970,4 +1978,339 @@ fn cw20_balance(fx: &Fixture, addr: &str) -> Uint128 {
         &cw20::Cw20QueryMsg::Balance { address: addr.into() },
     ).unwrap();
     bal.balance
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.5.0 — Vesting (TLA-Lock) + Promo whitelist (multi-address slots)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Test helper: list with V1.5 vesting + whitelist combinations.
+
+use crate::msg::WhitelistEntry as WLEntry;
+
+#[allow(clippy::too_many_arguments)]
+fn list_nft_v15(
+    fx: &mut Fixture,
+    seller: &str,
+    collection: Coll,
+    token_id: &str,
+    price: u128,
+    lock_in_blocks: Option<u64>,
+    whitelist: Option<Vec<WLEntry>>,
+    whitelisted_buyer: Option<String>,
+) -> anyhow::Result<()> {
+    let list_msg = ListNftMsg {
+        price: Uint128::new(price),
+        payment: PaymentType::Native { denom: DENOM.into() },
+        expires_in_blocks: 0,
+        whitelisted_buyer,
+        lock_in_blocks,
+        whitelist,
+    };
+    let market = fx.market.to_string();
+    let coll_addr = match collection {
+        Coll::Crystal => fx.crystal.clone(),
+        Coll::Other => fx.other_collection.clone(),
+    };
+    fx.app
+        .execute_contract(
+            Addr::unchecked(seller),
+            coll_addr,
+            &cw721_base::ExecuteMsg::<Empty, Empty>::SendNft {
+                contract: market,
+                token_id: token_id.into(),
+                msg: to_json_binary(&list_msg).unwrap(),
+            },
+            &[],
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{}", e.root_cause()))
+}
+
+// ─── Inv 42 ─────────────────────────────────────────────────────────────────
+// Vesting buy escrows NFT (not transferred to buyer)
+
+#[test]
+fn invariant_42_vesting_buy_escrows_nft() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, Some(100), None, None).unwrap();
+
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap();
+
+    // NFT still owned by the marketplace — bob does NOT have it yet
+    let owner_resp: cw721::OwnerOfResponse = fx.app.wrap()
+        .query_wasm_smart(&fx.crystal, &cw721::Cw721QueryMsg::OwnerOf {
+            token_id: "1".into(), include_expired: None,
+        }).unwrap();
+    assert_eq!(owner_resp.owner, fx.market.to_string(),
+        "vesting buy must keep NFT in marketplace escrow");
+
+    // Listing still exists, in locked state
+    let l: crate::state::Listing = fx.app.wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Listing { listing_id: 1 }).unwrap();
+    assert_eq!(l.locked_for.as_ref().map(|a| a.as_str()), Some("bob"));
+    assert!(l.time_locked_until.is_some());
+}
+
+// ─── Inv 43 ─────────────────────────────────────────────────────────────────
+// Release before unlock fails
+
+#[test]
+fn invariant_43_release_before_unlock_fails() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, Some(1000), None, None).unwrap();
+
+    fx.app.execute_contract(
+        Addr::unchecked("bob"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap();
+
+    // Don't advance blocks — try to release immediately
+    let err = fx.app.execute_contract(
+        Addr::unchecked("anyone"),
+        fx.market.clone(),
+        &ExecuteMsg::Release { listing_id: 1 },
+        &[],
+    ).unwrap_err();
+    assert_err(&err, "Vesting period not over");
+}
+
+// ─── Inv 44 ─────────────────────────────────────────────────────────────────
+// Release after unlock transfers NFT to buyer
+
+#[test]
+fn invariant_44_release_after_unlock_transfers_nft() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, Some(50), None, None).unwrap();
+
+    fx.app.execute_contract(
+        Addr::unchecked("bob"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap();
+
+    // Advance blocks past unlock
+    fx.app.update_block(|b| b.height += 100);
+
+    // Anyone (carol) can call Release
+    fx.app.execute_contract(
+        Addr::unchecked("carol"),
+        fx.market.clone(),
+        &ExecuteMsg::Release { listing_id: 1 },
+        &[],
+    ).unwrap();
+
+    // NFT now belongs to bob
+    let owner_resp: cw721::OwnerOfResponse = fx.app.wrap()
+        .query_wasm_smart(&fx.crystal, &cw721::Cw721QueryMsg::OwnerOf {
+            token_id: "1".into(), include_expired: None,
+        }).unwrap();
+    assert_eq!(owner_resp.owner, "bob");
+
+    // Listing removed
+    let res = fx.app.wrap().query_wasm_smart::<crate::state::Listing>(
+        &fx.market, &QueryMsg::Listing { listing_id: 1 },
+    );
+    assert!(res.is_err(), "listing must be removed after release");
+}
+
+// ─── Inv 45 ─────────────────────────────────────────────────────────────────
+// Cancel listing in locked state fails (seller already paid)
+
+#[test]
+fn invariant_45_cancel_locked_listing_fails() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, Some(100), None, None).unwrap();
+
+    fx.app.execute_contract(
+        Addr::unchecked("bob"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap();
+
+    // Alice tries to cancel — should fail because listing is locked
+    let err = fx.app.execute_contract(
+        Addr::unchecked("alice"),
+        fx.market.clone(),
+        &ExecuteMsg::CancelListing { listing_id: 1 },
+        &[],
+    ).unwrap_err();
+    assert_err(&err, "locked");
+}
+
+// ─── Inv 46 ─────────────────────────────────────────────────────────────────
+// Whitelist with multiple addresses — first whitelisted buyer consumes a slot
+
+#[test]
+fn invariant_46_whitelist_first_buyer_consumes_slot() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+
+    let whitelist = vec![
+        WLEntry { addr: "bob".into(), max_buys: 1 },
+        WLEntry { addr: "carol".into(), max_buys: 1 },
+    ];
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, None, Some(whitelist), None).unwrap();
+
+    // Bob (whitelisted) buys successfully
+    fx.app.execute_contract(
+        Addr::unchecked("bob"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap();
+
+    // Bob now owns the NFT (atomic — no time-lock)
+    let owner_resp: cw721::OwnerOfResponse = fx.app.wrap()
+        .query_wasm_smart(&fx.crystal, &cw721::Cw721QueryMsg::OwnerOf {
+            token_id: "1".into(), include_expired: None,
+        }).unwrap();
+    assert_eq!(owner_resp.owner, "bob");
+}
+
+// ─── Inv 47 ─────────────────────────────────────────────────────────────────
+// Whitelist non-member rejected
+
+#[test]
+fn invariant_47_whitelist_non_member_rejected() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+
+    let whitelist = vec![WLEntry { addr: "bob".into(), max_buys: 1 }];
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, None, Some(whitelist), None).unwrap();
+
+    // Stranger (not in whitelist) tries to buy
+    let err = fx.app.execute_contract(
+        Addr::unchecked("stranger"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap_err();
+    assert_err(&err, "not on this listing");
+}
+
+// ─── Inv 48 ─────────────────────────────────────────────────────────────────
+// Whitelist + whitelisted_buyer mutual exclusion enforced at list-time
+
+#[test]
+fn invariant_48_whitelist_and_private_conflict_rejected() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+
+    let err = list_nft_v15(
+        &mut fx, "alice", Coll::Crystal, "1", 1_000_000, None,
+        Some(vec![WLEntry { addr: "bob".into(), max_buys: 1 }]),
+        Some("carol".into()),
+    ).unwrap_err();
+    assert_err(&err, "Set whitelisted_buyer OR whitelist");
+}
+
+// ─── Inv 49 ─────────────────────────────────────────────────────────────────
+// TLA + whitelist combined: whitelisted buyer triggers locked state,
+// listing exits whitelist mode (only one buyer can fill a TLA listing)
+
+#[test]
+fn invariant_49_tla_plus_whitelist_combined() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+
+    let whitelist = vec![
+        WLEntry { addr: "bob".into(), max_buys: 1 },
+        WLEntry { addr: "carol".into(), max_buys: 1 },
+    ];
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, Some(50), Some(whitelist), None).unwrap();
+
+    // Bob (whitelisted) buys — payment routed, NFT escrowed, locked_for = bob
+    fx.app.execute_contract(
+        Addr::unchecked("bob"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap();
+
+    let l: crate::state::Listing = fx.app.wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Listing { listing_id: 1 }).unwrap();
+    assert_eq!(l.locked_for.as_ref().map(|a| a.as_str()), Some("bob"));
+
+    // Carol (also whitelisted) tries to buy — listing is locked
+    let err = fx.app.execute_contract(
+        Addr::unchecked("carol"),
+        fx.market.clone(),
+        &ExecuteMsg::BuyNft { listing_id: 1 },
+        &coins(1_000_000, DENOM),
+    ).unwrap_err();
+    assert_err(&err, "locked");
+}
+
+// ─── Inv 50 ─────────────────────────────────────────────────────────────────
+// AcceptOffer on a vesting (TLA) listing also enters locked state
+
+#[test]
+fn invariant_50_accept_offer_on_vesting_listing_locks() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_v15(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, Some(100), None, None).unwrap();
+
+    // Bob makes an offer
+    fx.app.execute_contract(
+        Addr::unchecked("bob"),
+        fx.market.clone(),
+        &ExecuteMsg::MakeOffer {
+            nft_contract: fx.crystal.to_string(),
+            token_id: "1".into(),
+            expires_in_blocks: 0,
+        },
+        &coins(800_000, DENOM),
+    ).unwrap();
+
+    // Alice accepts → payments route, but NFT stays escrowed (vesting)
+    fx.app.execute_contract(
+        Addr::unchecked("alice"),
+        fx.market.clone(),
+        &ExecuteMsg::AcceptOffer { offer_id: 1 },
+        &[],
+    ).unwrap();
+
+    // NFT not transferred yet
+    let owner_resp: cw721::OwnerOfResponse = fx.app.wrap()
+        .query_wasm_smart(&fx.crystal, &cw721::Cw721QueryMsg::OwnerOf {
+            token_id: "1".into(), include_expired: None,
+        }).unwrap();
+    assert_eq!(owner_resp.owner, fx.market.to_string());
+
+    // Listing is locked-for bob
+    let l: crate::state::Listing = fx.app.wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Listing { listing_id: 1 }).unwrap();
+    assert_eq!(l.locked_for.as_ref().map(|a| a.as_str()), Some("bob"));
+}
+
+// ─── Inv 51 ─────────────────────────────────────────────────────────────────
+// Vesting duration over MAX_TIME_LOCK_BLOCKS rejected at list-time
+
+#[test]
+fn invariant_51_vesting_duration_cap_enforced() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+
+    // 50_000_000 > MAX_TIME_LOCK_BLOCKS (10M)
+    let err = list_nft_v15(
+        &mut fx, "alice", Coll::Crystal, "1", 1_000_000,
+        Some(50_000_000), None, None,
+    ).unwrap_err();
+    assert_err(&err, "Vesting duration too long");
 }

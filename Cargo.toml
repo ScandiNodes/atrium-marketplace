@@ -1,8 +1,8 @@
 [package]
 name = "atrium-marketplace"
-version = "1.4.0-rc1"
+version = "1.5.0-rc1"
 edition = "2021"
-description = "Atrium NFT marketplace contract for Solid — adds optional whitelisted_buyer for private (OTC) listings"
+description = "Atrium NFT marketplace contract for Solid — adds vesting (TLA-Lock) listings + multi-address consumable-slot whitelists"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

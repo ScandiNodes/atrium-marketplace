@@ -1,4 +1,91 @@
-# Atrium Marketplace — Internal Audit (v1.3.0-rc1)
+# Atrium Marketplace — Internal Audit (v1.5.0-rc1)
+
+## V1.5.0 — Vesting (TLA-Lock) + Promo whitelist (Daniel 2026-04-26)
+
+Two operator-requested original primitives shipped together as one
+additive migration on top of V1.4. Designed through Hormozi value-stack +
+StoryBrand SB7 lenses (every toggle has 4-5 stacked use-cases visible
+in the modal copy; failure-modes documented).
+
+### A — Vesting (TLA-Lock) listings
+
+Sellers can list with `lock_in_blocks` (e.g. 30 days = 432 000 blocks).
+At BuyNft time, payments route to seller atomically (fee+royalty+seller
+share) — but the NFT stays escrowed in the marketplace. After
+`block.height >= time_locked_until`, anyone can call
+`Release { listing_id }` to ship the NFT to the original buyer.
+
+Use cases (Hormozi value-stack):
+- DAO treasury sales with anti-flip vesting
+- Structured OTC with delivery scheduling
+- Tax-year period-shifting
+- Pre-launch allocation proofs
+- Founder anti-dump schedules
+
+**No publicly-documented Cosmos marketplace ships this primitive.**
+Operator-channel intel only (BBL/Boost). Atrium is now the documented
+reference.
+
+Hard cap: `MAX_TIME_LOCK_BLOCKS = 10_000_000` (~1.9 years).
+
+### B — Promo whitelist (multi-address consumable slots)
+
+Sellers can attach a `whitelist: Vec<(addr, max_buys)>` to a listing.
+At BuyNft / AcceptOffer / AcceptCollectionOffer time the buyer's slot
+is decremented, listing closes when all slots consumed.
+
+Use cases:
+- Holder-snapshot promotions (paste qualified wallets)
+- Twin-flame / cross-collection rewards
+- Whitelist mints via marketplace
+- Multi-address OTC across team members
+
+Mutually exclusive with V1.4's `whitelisted_buyer`. Hard cap: 100 entries.
+
+### Migration phoenix-1
+
+| | Värde |
+|---|---|
+| Wasm sha256 | `f7ac4c1574e326141eb4e5082c8bc2ee495cc16b2780446e19975866f6dcdd18` |
+| Store-tx | `F6AE0E57C1CF05B78E2AAD8E148573D65D6F1C34FA7398900A0A18A7E561F4B2` (h. 20731812) |
+| Migrate-tx | `FBC1F4A7A8EDC2D5C4AB9B681AEEB61AABE5057585B8C9CB23A612BB516B613C` (h. 20731816) |
+| New code_id | **3853** (was 3852) |
+| Migrate signer | `atrium-admin` |
+| State preserved | ✓ V1.4 listings load with `time_locked_until: null`, `whitelist: null` |
+
+Companion admin tx: `add_collection` for Alliance NFT Collection at
+`277711F6BFFB3A5FC0340CF0EFB9874B16ED27476B6C2856A3811BEE5C5F378F`.
+Allowlist now: CAPA Crystals + Scandalous Birds + Alliance NFT.
+
+### Tests
+
+**51/51 invariants pass.** 10 new V1.5 invariants (42-51):
+
+| # | Test |
+|---|---|
+| 42 | Vesting buy escrows NFT (not transferred) |
+| 43 | Release before unlock fails |
+| 44 | Release after unlock transfers NFT to buyer (anyone can call) |
+| 45 | Cancel locked listing fails |
+| 46 | Whitelist first-buyer consumes slot |
+| 47 | Whitelist non-member rejected |
+| 48 | Whitelist + whitelisted_buyer mutual exclusion at list-time |
+| 49 | TLA + whitelist combined: first-fill locks listing |
+| 50 | AcceptOffer on vesting listing also locks |
+| 51 | Vesting duration > MAX_TIME_LOCK_BLOCKS rejected |
+
+### Findings (V1.5-specific)
+
+**No critical, no high.** Three low findings:
+
+- **L-V1.5.1 [LOW]** Per-listing whitelist (not cross-listing). Documented;
+  cross-listing shared whitelist is V1.6 candidate.
+- **L-V1.5.2 [LOW]** Vesting cap (~1.9 years) hard-coded. Sellers wanting
+  longer must re-list at expiry.
+- **L-V1.5.3 [LOW]** No admin force-release path for disaster recovery.
+  V1.6 candidate.
+
+---
 
 ## V1.3.0 — Trait-aware + bulk SOLID collection offers (Daniel 2026-04-26)
 

@@ -69,6 +69,51 @@ pub struct Listing {
     /// post-migrate (they have no whitelisted_buyer field yet → None).
     #[serde(default)]
     pub whitelisted_buyer: Option<Addr>,
+
+    // ─── V1.5.0: vesting (TLA-Lock) + promo whitelist ─────────────
+
+    /// V1.5.0: optional time-lock ("Vesting listing"). When set, BuyNft
+    /// PAYS THE SELLER IMMEDIATELY (fee + royalty + seller share routed
+    /// at buy-time, locking in the V1.2 fee schedule), but the NFT itself
+    /// stays escrowed in the marketplace. NFT releases to the buyer via
+    /// `Release { listing_id }` once `block.height >= time_locked_until`.
+    /// Anyone may call Release once the unlock height is reached.
+    /// `None` = atomic settlement (V1.0 behaviour).
+    /// Hard-capped by `MAX_TIME_LOCK_BLOCKS` to bound NFT-trap risk.
+    #[serde(default)]
+    pub time_locked_until: Option<u64>,
+
+    /// V1.5.0: when set, the listing is in the LOCKED post-buy state —
+    /// buyer paid + payments routed, NFT escrowed pending Release{}.
+    /// The address stored is the buyer who'll receive the NFT.
+    /// `None` = pre-buy (or non-vesting listing).
+    /// Set in execute_buy_* and execute_accept_offer when
+    /// `time_locked_until` is in the future.
+    #[serde(default)]
+    pub locked_for: Option<Addr>,
+
+    /// V1.5.0: optional multi-address whitelist with consumable slots.
+    /// Each entry is a (address, remaining_buys) pair. On every BuyNft /
+    /// AcceptOffer, the buyer's slot is decremented. Slots that hit 0
+    /// are pruned. Mutually exclusive with `whitelisted_buyer` — set
+    /// ONE or the other, never both, validated at list-time.
+    /// Use cases (Hormozi value-stack):
+    ///   • Holder-snapshot promo (paste qualified wallets)
+    ///   • Twin-flame / cross-collection rewards
+    ///   • 1-per-wallet whitelist mint via marketplace
+    ///   • Multi-address OTC across team members
+    /// Hard-capped by `MAX_WHITELIST_SLOTS` to bound storage + gas.
+    #[serde(default)]
+    pub whitelist: Option<Vec<WhitelistSlot>>,
+}
+
+/// V1.5.0: One entry in a Listing's promo whitelist.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct WhitelistSlot {
+    pub addr: Addr,
+    /// Remaining buys this address has. Decrements on each fill.
+    /// Reaches 0 → entry pruned from the whitelist on next save.
+    pub remaining: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -262,3 +307,14 @@ pub const MAX_TRADES_PER_OFFER: u32 = 1000;
 /// Bigger registries need a different verification scheme; for V1.3 we
 /// assume per-collection token-set ≤ ~64K which fits Atrium scope easily.
 pub const MAX_MERKLE_DEPTH: usize = 16;
+
+/// V1.5.0 hard cap on vesting-listing duration. 10M blocks at Terra2's
+/// ~6s block-time ≈ 1.9 years. Bounds the NFT-escrow trap-risk in case
+/// of admin-pause or operator absence; sellers wanting longer commit
+/// re-list at expiry (free + repeatable).
+pub const MAX_TIME_LOCK_BLOCKS: u64 = 10_000_000;
+
+/// V1.5.0 hard cap on whitelist size per listing. Caps gas at
+/// list-time (linear validate + dedup) and storage cost. Operators
+/// running larger snapshots can split into multiple linked listings.
+pub const MAX_WHITELIST_SLOTS: u32 = 100;
