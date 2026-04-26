@@ -1,8 +1,8 @@
 [package]
 name = "atrium-marketplace"
-version = "1.3.0-rc1"
+version = "1.4.0-rc1"
 edition = "2021"
-description = "Atrium NFT marketplace contract for Solid — Cosmic-free fees + trait-aware collection offers"
+description = "Atrium NFT marketplace contract for Solid — adds optional whitelisted_buyer for private (OTC) listings"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -60,6 +60,15 @@ pub struct Listing {
     pub expires_at: u64,
     /// Block height when listed
     pub created_at: u64,
+    /// V1.4.0: optional private-listing target. When `Some(addr)`, only
+    /// that wallet can BuyNft (direct buy) AND only an Offer from that
+    /// wallet can be Accepted by the seller. Used for OTC deals where
+    /// the seller wants to lock the listing to a known counterparty.
+    /// `None` = open listing (V1.0 behaviour).
+    /// `#[serde(default)]` keeps V1.3-stored listings deserialisable
+    /// post-migrate (they have no whitelisted_buyer field yet → None).
+    #[serde(default)]
+    pub whitelisted_buyer: Option<Addr>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]

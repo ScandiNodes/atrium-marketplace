@@ -277,6 +277,13 @@ fn execute_receive_nft(
         0
     };
 
+    // V1.4.0: optional private-listing target. Validate the address up-front
+    // so a typo can't survive into storage and brick the listing.
+    let whitelisted_buyer = match &list_msg.whitelisted_buyer {
+        Some(s) if !s.is_empty() => Some(deps.api.addr_validate(s)?),
+        _ => None,
+    };
+
     let listing = Listing {
         id,
         seller: seller.clone(),
@@ -286,6 +293,7 @@ fn execute_receive_nft(
         payment: list_msg.payment.clone(),
         expires_at,
         created_at: env.block.height,
+        whitelisted_buyer,
     };
 
     LISTINGS.save(deps.storage, id, &listing)?;
@@ -298,13 +306,18 @@ fn execute_receive_nft(
         .saturating_add(1);
     ACTIVE_LISTINGS_PER_COLLECTION.save(deps.storage, nft_contract.as_str(), &new_count)?;
 
-    Ok(Response::new()
+    let mut resp = Response::new()
         .add_attribute("action", "list_nft")
         .add_attribute("listing_id", id.to_string())
         .add_attribute("seller", seller)
         .add_attribute("nft_contract", nft_contract)
         .add_attribute("token_id", token_id)
-        .add_attribute("price", list_msg.price))
+        .add_attribute("price", list_msg.price);
+    // V1.4: surface private-listing target for indexers/UI badges.
+    if let Some(wb) = &listing.whitelisted_buyer {
+        resp = resp.add_attribute("whitelisted_buyer", wb.as_str());
+    }
+    Ok(resp)
 }
 
 // ───── CW20 Receive: Buy or Offer ─────
@@ -386,6 +399,16 @@ fn execute_buy_native(
         return Err(ContractError::SelfPurchase {});
     }
 
+    // V1.4: private-listing gate. If whitelisted_buyer is set, only that
+    // wallet can call BuyNft. Mirrors AcceptOffer's check below.
+    if let Some(wb) = &listing.whitelisted_buyer {
+        if &info.sender != wb {
+            return Err(ContractError::ListingPrivate {
+                whitelisted: wb.to_string(),
+            });
+        }
+    }
+
     // Verify payment type is native
     let expected_denom = match &listing.payment {
         PaymentType::Native { denom } => denom.clone(),
@@ -462,6 +485,16 @@ fn execute_buy_cw20(
         return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
             .add_attribute("action", "buy_nft_refund")
             .add_attribute("reason", "self_purchase"));
+    }
+
+    // V1.4: private-listing gate. CW20 path refunds (we already received
+    // funds) instead of erroring, so the buyer's tokens come back.
+    if let Some(wb) = &listing.whitelisted_buyer {
+        if &buyer != wb {
+            return Ok(refund_cw20(&buyer, &cw20_contract, amount)?
+                .add_attribute("action", "buy_nft_refund")
+                .add_attribute("reason", "listing_private"));
+        }
     }
 
     // Verify CW20 contract matches listing payment type
@@ -888,6 +921,18 @@ fn execute_accept_offer(
 
     if info.sender != listing.seller {
         return Err(ContractError::NotSeller {});
+    }
+
+    // V1.4: private-listing gate also applies on accept-offer. The seller
+    // can ONLY accept offers from the whitelisted_buyer when set. This is
+    // the symmetric case to BuyNft — if seller wanted any-buyer they
+    // should not have set whitelisted_buyer at list-time.
+    if let Some(wb) = &listing.whitelisted_buyer {
+        if &offer.buyer != wb {
+            return Err(ContractError::ListingPrivate {
+                whitelisted: wb.to_string(),
+            });
+        }
     }
 
     // AUDIT FIX: Validate offer payment type matches listing payment type
@@ -1932,6 +1977,17 @@ fn execute_accept_collection_offer(
     let listing = LISTINGS.load(deps.storage, listing_id)?;
     if info.sender != listing.seller {
         return Err(ContractError::NotListedBySeller {});
+    }
+    // V1.4: if seller marked their listing as private to wallet X, they
+    // can only fulfil collection offers WHOSE BUYER IS X. Otherwise the
+    // private-listing semantics would leak (seller could accept any
+    // collection-offer-buyer to get the NFT off via the back door).
+    if let Some(wb) = &listing.whitelisted_buyer {
+        if &offer.buyer != wb {
+            return Err(ContractError::ListingPrivate {
+                whitelisted: wb.to_string(),
+            });
+        }
     }
     match (&listing.payment, &offer.payment) {
         (PaymentType::Native { denom: d1 }, PaymentType::Native { denom: d2 }) if d1 == d2 => {}

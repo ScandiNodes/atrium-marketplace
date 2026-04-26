@@ -256,6 +256,7 @@ fn list_nft_native(
             denom: DENOM.into(),
         },
         expires_in_blocks,
+    whitelisted_buyer: None,
     };
     let market = fx.market.to_string();
     let coll_addr = match collection {
@@ -291,6 +292,7 @@ fn list_nft_cw20(
             contract_addr: fx.capa.to_string(),
         },
         expires_in_blocks,
+    whitelisted_buyer: None,
     };
     let market = fx.market.to_string();
     let coll_addr = match collection {
@@ -1749,4 +1751,223 @@ fn invariant_37_bad_merkle_proof_rejected() {
         )
         .unwrap_err();
     assert_err(&err, "Merkle proof failed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.4.0 — Private listings (whitelisted_buyer)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Test helper: list with a whitelisted_buyer field. Mirrors
+// list_nft_native but threads the V1.4 field through ListNftMsg.
+fn list_nft_native_private(
+    fx: &mut Fixture,
+    seller: &str,
+    collection: Coll,
+    token_id: &str,
+    price: u128,
+    whitelisted_buyer: &str,
+) -> anyhow::Result<()> {
+    let list_msg = ListNftMsg {
+        price: Uint128::new(price),
+        payment: PaymentType::Native { denom: DENOM.into() },
+        expires_in_blocks: 0,
+        whitelisted_buyer: Some(whitelisted_buyer.into()),
+    };
+    let market = fx.market.to_string();
+    let coll_addr = match collection {
+        Coll::Crystal => fx.crystal.clone(),
+        Coll::Other => fx.other_collection.clone(),
+    };
+    fx.app
+        .execute_contract(
+            Addr::unchecked(seller),
+            coll_addr,
+            &cw721_base::ExecuteMsg::<Empty, Empty>::SendNft {
+                contract: market,
+                token_id: token_id.into(),
+                msg: to_json_binary(&list_msg).unwrap(),
+            },
+            &[],
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{}", e.root_cause()))
+}
+
+// ─── Inv 38 ─────────────────────────────────────────────────────────────────
+// Private listing: only whitelisted buyer can BuyNft
+
+#[test]
+fn invariant_38_private_listing_only_whitelisted_buyer_can_buy() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native_private(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, "bob").unwrap();
+
+    // Stranger tries to buy — should fail with "private"
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("stranger"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap_err();
+    assert_err(&err, "private");
+
+    // Bob (whitelisted) succeeds
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap();
+}
+
+// ─── Inv 39 ─────────────────────────────────────────────────────────────────
+// Private listing: only whitelisted buyer's offer can be Accepted
+
+#[test]
+fn invariant_39_private_listing_seller_can_only_accept_whitelisted_offer() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native_private(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, "bob").unwrap();
+
+    // Stranger makes an offer — allowed (no offer-side gate; refund via cancel)
+    fx.app
+        .execute_contract(
+            Addr::unchecked("stranger"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeOffer {
+                nft_contract: fx.crystal.to_string(),
+                token_id: "1".into(),
+                expires_in_blocks: 0,
+            },
+            &coins(900_000, DENOM),
+        )
+        .unwrap();
+
+    // Bob also makes an offer
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeOffer {
+                nft_contract: fx.crystal.to_string(),
+                token_id: "1".into(),
+                expires_in_blocks: 0,
+            },
+            &coins(800_000, DENOM),
+        )
+        .unwrap();
+
+    // Alice CAN'T accept stranger's offer (offer_id=1) — listing is private to bob
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptOffer { offer_id: 1 },
+            &[],
+        )
+        .unwrap_err();
+    assert_err(&err, "private");
+
+    // Alice CAN accept bob's offer (offer_id=2)
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptOffer { offer_id: 2 },
+            &[],
+        )
+        .unwrap();
+}
+
+// ─── Inv 40 ─────────────────────────────────────────────────────────────────
+// Open listing (no whitelisted_buyer) — anyone can buy + offer-accept (V1.0
+// regression-guard ensuring V1.4 didn't break the default path)
+
+#[test]
+fn invariant_40_open_listing_default_path_unchanged() {
+    let mut fx = setup();
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+
+    // Any wallet can buy
+    fx.app
+        .execute_contract(
+            Addr::unchecked("stranger"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap();
+}
+
+// ─── Inv 41 ─────────────────────────────────────────────────────────────────
+// Private listing CW20 path refunds (instead of erroring) when buyer
+// isn't whitelisted — funds came in via Receive so can't reject
+
+#[test]
+fn invariant_41_private_listing_cw20_path_refunds_non_whitelisted() {
+    let mut fx = setup();
+    let capa = fx.capa.clone();
+
+    mint_crystal(&mut fx, "alice", "1");
+
+    // Alice lists with CW20 payment + whitelisted_buyer = bob
+    let list_msg = ListNftMsg {
+        price: Uint128::new(1_000_000),
+        payment: PaymentType::Cw20 { contract_addr: capa.to_string() },
+        expires_in_blocks: 0,
+        whitelisted_buyer: Some("bob".into()),
+    };
+    let market = fx.market.to_string();
+    fx.app
+        .execute_contract(
+            Addr::unchecked("alice"),
+            fx.crystal.clone(),
+            &cw721_base::ExecuteMsg::<Empty, Empty>::SendNft {
+                contract: market.clone(),
+                token_id: "1".into(),
+                msg: to_json_binary(&list_msg).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Stranger sends CAPA to buy — should be refunded (NOT errored)
+    let stranger_before = cw20_balance(&fx, "stranger");
+    fx.app
+        .execute_contract(
+            Addr::unchecked("stranger"),
+            capa.clone(),
+            &Cw20ExecuteMsg::Send {
+                contract: market.clone(),
+                amount: Uint128::new(1_000_000),
+                msg: to_json_binary(&Cw20HookMsg::BuyNft { listing_id: 1 }).unwrap(),
+            },
+            &[],
+        )
+        .unwrap();
+    let stranger_after = cw20_balance(&fx, "stranger");
+    // Funds came back — net zero for stranger
+    assert_eq!(stranger_before, stranger_after);
+
+    // Listing is still active (not consumed)
+    let listing: crate::state::Listing = fx.app.wrap().query_wasm_smart(
+        &fx.market,
+        &QueryMsg::Listing { listing_id: 1 },
+    ).unwrap();
+    assert_eq!(listing.id, 1);
+}
+
+fn cw20_balance(fx: &Fixture, addr: &str) -> Uint128 {
+    let bal: cw20::BalanceResponse = fx.app.wrap().query_wasm_smart(
+        &fx.capa,
+        &cw20::Cw20QueryMsg::Balance { address: addr.into() },
+    ).unwrap();
+    bal.balance
 }

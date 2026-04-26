@@ -184,6 +184,12 @@ pub struct ListNftMsg {
     pub payment: PaymentType,
     /// Blocks until expiry (0 = never expires)
     pub expires_in_blocks: u64,
+    /// V1.4.0: optional. When set, ONLY this wallet can BuyNft AND only
+    /// an Offer from this wallet can be AcceptedOffer'd by the seller.
+    /// Use for OTC / peer-to-peer private sales. None = open listing.
+    /// Defaults to None for backwards compatibility with V1.3 frontends.
+    #[serde(default)]
+    pub whitelisted_buyer: Option<String>,
 }
 
 /// Message embedded in CW20 Send callback

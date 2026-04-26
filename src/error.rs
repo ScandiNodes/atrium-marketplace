@@ -150,4 +150,11 @@ pub enum ContractError {
     /// by the seller-initiator (mirrors AcceptOffer's NoActiveListing rail).
     #[error("NFT must be actively listed by you to fulfil this collection offer")]
     NotListedBySeller {},
+
+    // ─── V1.4.0: Private listings ────────────────────────────────────────
+
+    /// Listing has whitelisted_buyer set; the calling buyer (or the offer's
+    /// buyer at accept-time) is not the whitelisted address.
+    #[error("This listing is private — only {whitelisted} can buy it")]
+    ListingPrivate { whitelisted: String },
 }
