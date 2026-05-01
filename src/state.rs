@@ -11,14 +11,31 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Contract admin
     pub owner: Addr,
-    /// Total marketplace fee in basis points (150 = 1.5%)
+    /// LEGACY total marketplace fee in basis points. Kept for storage
+    /// compatibility with V1.5.x — V1.6.0 introduces an explicit 3-tier
+    /// schedule below. Reads of `fee_bps` after migration map to
+    /// `fee_bps_non_holder` (one-sided fee model: a single fee per
+    /// trade, debited from seller proceeds, determined by the
+    /// best-of-two tier between buyer and seller).
     pub fee_bps: u16,
-    /// Treasury address (receives 2/3 of fee = 1.0%)
+    /// V1.6.0: fee bps when neither buyer NOR seller hold a Crystal.
+    /// Default 500 (5.00%). Admin-mutable via UpdateConfig.
+    #[serde(default)]
+    pub fee_bps_non_holder: u16,
+    /// V1.6.0: fee bps when at least one side holds any Crystal but
+    /// neither holds Cosmic. Default 150 (1.50%). Admin-mutable.
+    #[serde(default)]
+    pub fee_bps_crystal: u16,
+    /// V1.6.0: fee bps when at least one side holds a Cosmic Crystal.
+    /// Default 0 (0.00%). Admin-mutable.
+    #[serde(default)]
+    pub fee_bps_cosmic: u16,
+    /// Treasury address (receives a share of fee per treasury_share_bps)
     pub treasury_addr: Addr,
-    /// CAPA reward pool address (receives 1/3 of fee = 0.5%)
+    /// CAPA reward pool address (receives the remainder of fee)
     pub capa_reward_addr: Addr,
-    /// Ratio of fee going to treasury (in bps out of fee_bps)
-    /// e.g. 100 out of 150 = treasury gets 1.0%
+    /// Ratio of fee going to treasury (in bps out of effective fee_bps)
+    /// Splits each collected fee between treasury and capa-reward.
     pub treasury_share_bps: u16,
     /// CAPA governance staking contract (for CAPA-staking fee discount queries)
     pub capa_gov_contract: Option<Addr>,

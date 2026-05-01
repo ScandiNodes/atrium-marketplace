@@ -12,8 +12,9 @@ use cw20::{Cw20Coin, Cw20ExecuteMsg, MinterResponse};
 use cw_multi_test::{App, AppBuilder, Contract, ContractWrapper, Executor};
 
 use crate::msg::{
-    CollectionOffersResponse, Cw20HookMsg, ExecuteMsg, FeeInfoResponse, InstantiateMsg,
-    IsAllowedResponse, ListNftMsg, QueryMsg, TraitProof, TraitRegistryResponse,
+    CollectionOffersResponse, Cw20HookMsg, ExecuteMsg, FeeInfoForTradeResponse, FeeInfoResponse,
+    InstantiateMsg, IsAllowedResponse, ListNftMsg, MigrateMsg, QueryMsg, TraitProof,
+    TraitRegistryResponse,
 };
 use crate::state::{CollectionOffer, LaunchCaps, PaymentType, TraitConstraint};
 
@@ -1091,6 +1092,9 @@ fn invariant_24_paused_blocks_listing_buy_offer() {
             fx.market.clone(),
             &ExecuteMsg::UpdateConfig {
                 fee_bps: None,
+                fee_bps_non_holder: None,
+                fee_bps_crystal: None,
+                fee_bps_cosmic: None,
                 treasury_addr: None,
                 capa_reward_addr: None,
                 treasury_share_bps: None,
@@ -2313,4 +2317,260 @@ fn invariant_51_vesting_duration_cap_enforced() {
         Some(50_000_000), None, None,
     ).unwrap_err();
     assert_err(&err, "Vesting duration too long");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.6.0 — One-sided best-of-two fee model (Daniel 2026-05-01)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These tests verify the V1.6 plumbing: that the new 3-tier schedule fields
+// exist, can be set via UpdateConfig + MigrateMsg, and that the new
+// FeeInfoForTrade query returns the right shape.
+//
+// IMPORTANT: full tier-aware behavior (Cosmic short-circuit, Crystal-tier
+// detection, best-of-buyer-seller) cannot be exercised end-to-end in this
+// test environment. The tier-resolution chain (highest_crystal_tier →
+// resolve_tier on ALTAR/FUSION/MINT contracts) is hardcoded to mainnet
+// addresses that don't exist in cw-multi-test, so resolve_tier silently
+// returns None for every token (already documented behavior). Buyers +
+// sellers therefore always fall through to fee_bps_non_holder.
+//
+// Full tier-coverage is deferred to a manual on-chain smoke test
+// post-deploy (Phase 2 verification — query FeeInfoForTrade with real
+// Cosmic-holder addresses on phoenix-1).
+
+#[test]
+fn v16_instantiate_seeds_tier_schedule() {
+    // Fresh-deploy invariant: instantiate sets the V1.6 tier fields to
+    // sane defaults so the contract is usable without running migrate.
+    let fx = setup();
+    let cfg: crate::state::Config = fx
+        .app
+        .wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Config {})
+        .unwrap();
+
+    // Setup uses fee_bps=150 → fee_bps_non_holder mirrors that.
+    assert_eq!(cfg.fee_bps, 150);
+    assert_eq!(cfg.fee_bps_non_holder, 150);
+    assert_eq!(cfg.fee_bps_crystal, 150);
+    assert_eq!(cfg.fee_bps_cosmic, 0);
+}
+
+#[test]
+fn v16_update_config_sets_each_tier_independently() {
+    // Admin can tune each tier independently — the production rollout
+    // will use this to set non_holder=500, crystal=150, cosmic=0.
+    let mut fx = setup();
+
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::UpdateConfig {
+                fee_bps: None,
+                fee_bps_non_holder: Some(500),
+                fee_bps_crystal: Some(150),
+                fee_bps_cosmic: Some(0),
+                treasury_addr: None,
+                capa_reward_addr: None,
+                treasury_share_bps: None,
+                capa_gov_contract: None,
+                paused: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+    let cfg: crate::state::Config = fx
+        .app
+        .wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(cfg.fee_bps_non_holder, 500);
+    assert_eq!(cfg.fee_bps_crystal, 150);
+    assert_eq!(cfg.fee_bps_cosmic, 0);
+    // Legacy field untouched
+    assert_eq!(cfg.fee_bps, 150);
+}
+
+#[test]
+fn v16_update_config_rejects_oversize_tier() {
+    // Each tier is bounded by MAX_FEE_BPS — admin cannot exceed it.
+    let mut fx = setup();
+    let err = fx
+        .app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::UpdateConfig {
+                fee_bps: None,
+                fee_bps_non_holder: Some(600), // > 5%
+                fee_bps_crystal: None,
+                fee_bps_cosmic: None,
+                treasury_addr: None,
+                capa_reward_addr: None,
+                treasury_share_bps: None,
+                capa_gov_contract: None,
+                paused: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert_err(&err, "Fee");
+}
+
+#[test]
+fn v16_fee_info_for_trade_query_returns_full_schedule() {
+    // The new dual-side preview query exposes all 3 tiers + applied tier
+    // so the frontend can render "Cosmic discount applied via seller"
+    // without re-deriving the logic.
+    let mut fx = setup();
+
+    // Move config to canonical V1.6 production rates
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::UpdateConfig {
+                fee_bps: None,
+                fee_bps_non_holder: Some(500),
+                fee_bps_crystal: Some(150),
+                fee_bps_cosmic: Some(0),
+                treasury_addr: None,
+                capa_reward_addr: None,
+                treasury_share_bps: None,
+                capa_gov_contract: None,
+                paused: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+    // No tier resolution in test env → both addrs read as non-holder.
+    let resp: FeeInfoForTradeResponse = fx
+        .app
+        .wrap()
+        .query_wasm_smart(
+            &fx.market,
+            &QueryMsg::FeeInfoForTrade {
+                buyer: Some("alice".to_string()),
+                seller: Some("bob".to_string()),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(resp.fee_bps, 500);
+    assert_eq!(resp.applied_tier, "non_holder");
+    assert_eq!(resp.fee_bps_non_holder, 500);
+    assert_eq!(resp.fee_bps_crystal, 150);
+    assert_eq!(resp.fee_bps_cosmic, 0);
+    assert_eq!(resp.buyer_tier, None);
+    assert_eq!(resp.seller_tier, None);
+}
+
+#[test]
+fn v16_fee_info_for_trade_handles_missing_addresses() {
+    // Either side can be omitted — graceful fallback to non-holder rate.
+    let fx = setup();
+    let resp: FeeInfoForTradeResponse = fx
+        .app
+        .wrap()
+        .query_wasm_smart(
+            &fx.market,
+            &QueryMsg::FeeInfoForTrade {
+                buyer: None,
+                seller: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(resp.fee_bps, 150); // mirrors setup's fee_bps_non_holder
+    assert_eq!(resp.applied_tier, "non_holder");
+}
+
+#[test]
+fn v16_settle_sale_uses_non_holder_rate_in_test_env() {
+    // End-to-end: list + buy. Tier resolution returns None in test env,
+    // so the trade should fall through to fee_bps_non_holder. Verifies
+    // the seller-side wiring doesn't crash the settlement flow.
+    //
+    // (Cosmic / Crystal-tier paths are deploy-time smoke-tested.)
+    let mut fx = setup();
+
+    // Set canonical V1.6 production rates so the math matches what
+    // production will actually compute.
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::UpdateConfig {
+                fee_bps: None,
+                fee_bps_non_holder: Some(500),
+                fee_bps_crystal: Some(150),
+                fee_bps_cosmic: Some(0),
+                treasury_addr: None,
+                capa_reward_addr: None,
+                treasury_share_bps: Some(333), // 2/3 to treasury
+                capa_gov_contract: None,
+                paused: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Alice mints + lists a Crystal token at 1_000_000 uluna.
+    mint_crystal(&mut fx, "alice", "v16_seller_test");
+    list_nft_native(
+        &mut fx,
+        "alice",
+        Coll::Crystal,
+        "v16_seller_test",
+        1_000_000,
+        0,
+    )
+    .unwrap();
+
+    // Bob buys at the listing price.
+    let alice_before = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+    let treasury_before = fx
+        .app
+        .wrap()
+        .query_balance(&fx.treasury, DENOM)
+        .unwrap()
+        .amount;
+    let capa_pool_before = fx
+        .app
+        .wrap()
+        .query_balance(&fx.capa_pool, DENOM)
+        .unwrap()
+        .amount;
+
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap();
+
+    let alice_after = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+    let treasury_after = fx
+        .app
+        .wrap()
+        .query_balance(&fx.treasury, DENOM)
+        .unwrap()
+        .amount;
+    let capa_pool_after = fx
+        .app
+        .wrap()
+        .query_balance(&fx.capa_pool, DENOM)
+        .unwrap()
+        .amount;
+
+    // 5% fee on 1_000_000 = 50_000. Alice receives 950_000.
+    assert_eq!(alice_after - alice_before, Uint128::new(950_000));
+    // Treasury share = 333/500 of 50_000 = 33_300. CAPA pool = 16_700.
+    assert_eq!(treasury_after - treasury_before, Uint128::new(33_300));
+    assert_eq!(capa_pool_after - capa_pool_before, Uint128::new(16_700));
 }

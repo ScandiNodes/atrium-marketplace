@@ -11,7 +11,7 @@ use cw721::TokensResponse;
 use crate::error::ContractError;
 use crate::msg::{
     AllowedCollectionsResponse, CollectionOffersResponse, CollectionStatsResponse, Cw20HookMsg,
-    ExecuteMsg, FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg, ListingsResponse,
+    ExecuteMsg, FeeInfoForTradeResponse, FeeInfoResponse, InstantiateMsg, IsAllowedResponse, ListNftMsg, ListingsResponse,
     MigrateMsg, OffersResponse, QueryMsg, RoyaltyInfoResponse, TraitProof, TraitRegistryResponse,
     WhitelistEntry,
 };
@@ -92,6 +92,13 @@ pub fn instantiate(
     let config = Config {
         owner: info.sender.clone(),
         fee_bps: msg.fee_bps,
+        // V1.6.0: seed the 3-tier schedule. Defaults match the post-migrate
+        // baseline so a fresh instantiate behaves identically to a migrated
+        // V1.5 contract that ran migrate(). Operators can override via
+        // UpdateConfig post-init.
+        fee_bps_non_holder: msg.fee_bps,
+        fee_bps_crystal: 150,
+        fee_bps_cosmic: 0,
         treasury_addr: deps.api.addr_validate(&msg.treasury_addr)?,
         capa_reward_addr: deps.api.addr_validate(&msg.capa_reward_addr)?,
         treasury_share_bps: msg.treasury_share_bps,
@@ -160,6 +167,9 @@ pub fn execute(
         } => execute_set_royalty(deps, info, nft_contract, recipient, royalty_bps),
         ExecuteMsg::UpdateConfig {
             fee_bps,
+            fee_bps_non_holder,
+            fee_bps_crystal,
+            fee_bps_cosmic,
             treasury_addr,
             capa_reward_addr,
             treasury_share_bps,
@@ -169,6 +179,9 @@ pub fn execute(
             deps,
             info,
             fee_bps,
+            fee_bps_non_holder,
+            fee_bps_crystal,
+            fee_bps_cosmic,
             treasury_addr,
             capa_reward_addr,
             treasury_share_bps,
@@ -690,16 +703,22 @@ fn execute_sale(
     // AUDIT FIX: Use actual paid amount (so accept_offer at the offer price works)
     let sale_price = paid;
 
-    // Calculate fees
-    let effective_fee_bps = get_effective_fee(deps.as_ref(), &config, buyer)?;
+    // Calculate fees — V1.6.0: best-of-buyer-seller tier wins.
+    // listing.seller is the address that gets debited; we pass it into
+    // get_effective_fee so a Cosmic seller short-circuits to 0% even
+    // when the buyer is a non-holder.
+    let effective_fee_bps =
+        get_effective_fee(deps.as_ref(), &config, buyer, Some(&listing.seller))?;
     let fee_amount = sale_price.multiply_ratio(effective_fee_bps as u128, 10000u128);
     let (treasury_amount, capa_amount) = if fee_amount.is_zero() || effective_fee_bps == 0 {
         (Uint128::zero(), Uint128::zero())
     } else {
-        // Split using the *base* fee_bps as denominator so the configured
-        // treasury_share_bps:capa_share ratio is preserved even after discount.
+        // Split using the EFFECTIVE fee bps as denominator so the configured
+        // treasury_share_bps:capa_share ratio is preserved across all 3 tiers.
+        // (V1.5 used legacy config.fee_bps which broke the ratio after
+        // V1.6 introduced multiple tiers.)
         let t = fee_amount
-            .multiply_ratio(config.treasury_share_bps as u128, config.fee_bps as u128);
+            .multiply_ratio(config.treasury_share_bps as u128, effective_fee_bps as u128);
         let c = fee_amount.checked_sub(t).unwrap_or(Uint128::zero());
         (t, c)
     };
@@ -1278,6 +1297,9 @@ fn execute_update_config(
     deps: DepsMut,
     info: MessageInfo,
     fee_bps: Option<u16>,
+    fee_bps_non_holder: Option<u16>,
+    fee_bps_crystal: Option<u16>,
+    fee_bps_cosmic: Option<u16>,
     treasury_addr: Option<String>,
     capa_reward_addr: Option<String>,
     treasury_share_bps: Option<u16>,
@@ -1290,11 +1312,31 @@ fn execute_update_config(
         return Err(ContractError::NotAdmin {});
     }
 
+    // Legacy fee_bps: kept for backwards compatibility with V1.5 callers.
+    // V1.6 effective-fee uses the explicit 3-tier fields below.
     if let Some(bps) = fee_bps {
         if bps > MAX_FEE_BPS {
             return Err(ContractError::FeeTooHigh { bps });
         }
         config.fee_bps = bps;
+    }
+    if let Some(bps) = fee_bps_non_holder {
+        if bps > MAX_FEE_BPS {
+            return Err(ContractError::FeeTooHigh { bps });
+        }
+        config.fee_bps_non_holder = bps;
+    }
+    if let Some(bps) = fee_bps_crystal {
+        if bps > MAX_FEE_BPS {
+            return Err(ContractError::FeeTooHigh { bps });
+        }
+        config.fee_bps_crystal = bps;
+    }
+    if let Some(bps) = fee_bps_cosmic {
+        if bps > MAX_FEE_BPS {
+            return Err(ContractError::FeeTooHigh { bps });
+        }
+        config.fee_bps_cosmic = bps;
     }
     if let Some(addr) = treasury_addr {
         config.treasury_addr = deps.api.addr_validate(&addr)?;
@@ -1312,14 +1354,25 @@ fn execute_update_config(
         config.paused = p;
     }
 
-    // AUDIT FIX: Re-check invariant after partial update
-    if config.treasury_share_bps > config.fee_bps {
+    // AUDIT FIX: Re-check invariant after partial update.
+    // Bound treasury_share_bps against the LARGEST possible effective fee
+    // (= highest of the 3 tiers + legacy fee_bps) so the share-split math
+    // never overruns regardless of which tier triggers.
+    let max_eff = config.fee_bps
+        .max(config.fee_bps_non_holder)
+        .max(config.fee_bps_crystal)
+        .max(config.fee_bps_cosmic);
+    if max_eff > 0 && config.treasury_share_bps > max_eff {
         return Err(ContractError::TreasuryShareTooHigh {});
     }
 
     CONFIG.save(deps.storage, &config)?;
 
-    Ok(Response::new().add_attribute("action", "update_config"))
+    Ok(Response::new()
+        .add_attribute("action", "update_config")
+        .add_attribute("fee_bps_non_holder", config.fee_bps_non_holder.to_string())
+        .add_attribute("fee_bps_crystal", config.fee_bps_crystal.to_string())
+        .add_attribute("fee_bps_cosmic", config.fee_bps_cosmic.to_string()))
 }
 
 // ───── Add / Remove allowlisted collection ─────
@@ -1493,41 +1546,94 @@ fn decrement_offers_per_nft(
     Ok(())
 }
 
-/// Calculate effective fee bps for a buyer.
+/// Calculate effective fee bps for a trade.
 ///
-/// V1.2.0 (Cosmic-only model — Daniel 2026-04-26):
+/// V1.6.0 — one-sided best-of-two model (Daniel 2026-05-01):
 ///
-///   Cosmic Crystal → 0 bps   (free trading; top-tier perk, ~50 wallets)
-///   Everyone else  → fee_bps (default 500 / 5.00%)
+///   Cosmic on EITHER side  → fee_bps_cosmic     (default 0   = 0.00%)
+///   non-Cosmic Crystal on either side → fee_bps_crystal (default 150 = 1.50%)
+///   neither side holds any Crystal     → fee_bps_non_holder (default 500 = 5.00%)
 ///
-/// Replaces V1.1.0's 5-rung ladder. Rationale: a tiered ladder dilutes the
-/// Cosmic premium and gives small discounts that nobody really values
-/// (operator-feedback 2026-04-26). A single sharp cliff between Cosmic
-/// (true free trading) and everyone-else (5%) makes Cosmic genuinely the
-/// apex perk and keeps marketplace economics intact.
+/// One-sided = a single fee per trade, debited from the seller's proceeds
+/// (preserves crypto-NFT marketplace convention — buyer pays the listed
+/// price, seller receives price minus fee). Best-of-two = the BEST tier
+/// between buyer and seller wins. This solves the prior "my Cosmic gives
+/// no value when I sell" complaint: a Cosmic seller now pays 0% fee
+/// regardless of who buys, AND a Cosmic buyer protects a non-holder seller.
 ///
-/// Tier resolution still walks ALTAR → FUSION → MINT contracts (mirrors
-/// `feedback_crystal_tier_resolution.md` — ascended/fused crystals
-/// aren't in MINT). Up to TIER_QUERY_LIMIT crystals checked per buyer
-/// to bound gas. Cosmic short-circuits the loop since it's the top.
+/// Tier resolution still walks ALTAR -> FUSION -> MINT contracts (see
+/// feedback_crystal_tier_resolution.md — ascended/fused crystals
+/// aren't in MINT). Up to TIER_QUERY_LIMIT crystals checked per address
+/// to bound gas. Cosmic short-circuits everything else.
 ///
-/// `highest_crystal_tier` still returns the highest owned tier name so
-/// FeeInfoResponse can surface it for UI badges, but only "cosmic" gets
-/// the discount.
-fn get_effective_fee(deps: Deps, config: &Config, buyer: &Addr) -> StdResult<u16> {
-    // Cosmic-only discount
-    let highest = highest_crystal_tier(deps, buyer)?;
-    if matches!(highest.as_deref(), Some("cosmic")) {
-        return Ok(0);
+/// Gas optimisation: check buyer FIRST, exit early on Cosmic without
+/// querying seller. Worst-case is two full scans (both non-Cosmic).
+///
+/// V1.5 callers still using the single-buyer signature can pass
+/// seller=None; that path falls back to legacy buyer-only semantics
+/// (Cosmic discount on buyer only). Retained for FeeInfo backward compat.
+fn get_effective_fee(
+    deps: Deps,
+    config: &Config,
+    buyer: &Addr,
+    seller: Option<&Addr>,
+) -> StdResult<u16> {
+    // Resolve buyer first — most frequent fast-path is Cosmic buyer.
+    let buyer_tier = highest_crystal_tier(deps, buyer)?;
+    if matches!(buyer_tier.as_deref(), Some("cosmic")) {
+        return Ok(config.fee_bps_cosmic);
     }
 
-    // CAPA-staker discount (TODO: integrate when capa_gov_contract is set)
+    // Resolve seller. If absent (FeeInfo query without seller), fall
+    // back to legacy buyer-only logic.
+    let seller_tier = match seller {
+        Some(s) => highest_crystal_tier(deps, s)?,
+        None => None,
+    };
+    if matches!(seller_tier.as_deref(), Some("cosmic")) {
+        return Ok(config.fee_bps_cosmic);
+    }
+
+    // Neither side is Cosmic. Crystal-tier discount if EITHER side holds
+    // any Crystal at all. (Tier identity beyond Cosmic doesn't matter for
+    // fee — Crystal is Crystal.)
+    if buyer_tier.is_some() || seller_tier.is_some() {
+        return Ok(config.fee_bps_crystal);
+    }
+
+    // CAPA-staker discount slot — placeholder for future integration.
     if let Some(_gov) = &config.capa_gov_contract {
         // Future: query staked CAPA, walk FEE_DISCOUNT_TIERS
-        // let staked: StakerResponse = deps.querier.query_wasm_smart(gov, ...)?;
     }
 
-    Ok(config.fee_bps)
+    Ok(config.fee_bps_non_holder)
+}
+
+/// Returns the effective tier label "name" for the trade — i.e. which
+/// of the 3 fee-tiers actually applied. Used in FeeInfoResponse + sale
+/// event attributes so frontend + indexers can show "Cosmic discount
+/// applied" badges without re-deriving the logic. Mirrors the same
+/// best-of-two priority as get_effective_fee.
+fn effective_trade_tier(
+    deps: Deps,
+    buyer: &Addr,
+    seller: Option<&Addr>,
+) -> StdResult<&'static str> {
+    let buyer_tier = highest_crystal_tier(deps, buyer)?;
+    if matches!(buyer_tier.as_deref(), Some("cosmic")) {
+        return Ok("cosmic");
+    }
+    let seller_tier = match seller {
+        Some(s) => highest_crystal_tier(deps, s)?,
+        None => None,
+    };
+    if matches!(seller_tier.as_deref(), Some("cosmic")) {
+        return Ok("cosmic");
+    }
+    if buyer_tier.is_some() || seller_tier.is_some() {
+        return Ok("crystal");
+    }
+    Ok("non_holder")
 }
 
 // ─── Crystal tier resolution chain (mainnet phoenix-1, hardcoded) ──────────
@@ -1689,14 +1795,17 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             let config = CONFIG.load(deps.storage)?;
             let (fee_bps, discount_bps, tier_opt) = if let Some(b) = buyer {
                 let addr = deps.api.addr_validate(&b)?;
-                let eff = get_effective_fee(deps, &config, &addr)?;
+                // V1.6.0: legacy single-side query — passes seller=None,
+                // hits buyer-only fallback in get_effective_fee.
+                let eff = get_effective_fee(deps, &config, &addr, None)?;
                 let t = highest_crystal_tier(deps, &addr).unwrap_or(None);
-                // saturating_sub guards a defensive underflow path
-                (eff, config.fee_bps.saturating_sub(eff), t)
+                // discount = legacy non-holder rate minus effective rate
+                let baseline = config.fee_bps_non_holder.max(config.fee_bps);
+                (eff, baseline.saturating_sub(eff), t)
             } else {
-                (config.fee_bps, 0, None)
+                // No buyer specified — return the non-holder baseline.
+                (config.fee_bps_non_holder.max(config.fee_bps), 0, None)
             };
-            // crystal_holder kept for backwards compat — derived from tier
             let holder = tier_opt.is_some();
             to_json_binary(&FeeInfoResponse {
                 fee_bps,
@@ -1704,6 +1813,47 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
                 discount_bps,
                 crystal_holder: holder,
                 crystal_tier: tier_opt,
+            })
+        }
+        QueryMsg::FeeInfoForTrade { buyer, seller } => {
+            // V1.6.0: dual-side fee preview — what would this trade cost
+            // given both sides? UI uses this on the listing-detail page
+            // when both addresses are known.
+            let config = CONFIG.load(deps.storage)?;
+            let buyer_addr = match buyer.as_ref() {
+                Some(b) => Some(deps.api.addr_validate(b)?),
+                None => None,
+            };
+            let seller_addr = match seller.as_ref() {
+                Some(s) => Some(deps.api.addr_validate(s)?),
+                None => None,
+            };
+
+            let (fee_bps, tier_label) = match (&buyer_addr, &seller_addr) {
+                (Some(b), s) => {
+                    let eff = get_effective_fee(deps, &config, b, s.as_ref())?;
+                    let lbl = effective_trade_tier(deps, b, s.as_ref())?;
+                    (eff, lbl)
+                }
+                // No buyer at all -> baseline non-holder rate.
+                (None, _) => (config.fee_bps_non_holder.max(config.fee_bps), "non_holder"),
+            };
+            let buyer_tier = match &buyer_addr {
+                Some(a) => highest_crystal_tier(deps, a).unwrap_or(None),
+                None => None,
+            };
+            let seller_tier = match &seller_addr {
+                Some(a) => highest_crystal_tier(deps, a).unwrap_or(None),
+                None => None,
+            };
+            to_json_binary(&FeeInfoForTradeResponse {
+                fee_bps,
+                applied_tier: tier_label.to_string(),
+                buyer_tier,
+                seller_tier,
+                fee_bps_non_holder: config.fee_bps_non_holder,
+                fee_bps_crystal: config.fee_bps_crystal,
+                fee_bps_cosmic: config.fee_bps_cosmic,
             })
         }
         QueryMsg::IsCollectionAllowed { nft_contract } => {

@@ -12,7 +12,18 @@ use crate::state::{
 // V1.1.0 migration takes no parameters — the contract just bumps its
 // cw2 version marker and starts using the new tier-ladder fee logic.
 #[cw_serde]
-pub struct MigrateMsg {}
+pub struct MigrateMsg {
+    /// V1.6.0: optional explicit defaults at migrate-time. When None,
+    /// the migrate fn backfills with safe defaults (5% / 1.5% / 0%).
+    /// Set explicitly to override at migrate-time without a follow-up
+    /// UpdateConfig tx.
+    #[serde(default)]
+    pub fee_bps_non_holder: Option<u16>,
+    #[serde(default)]
+    pub fee_bps_crystal: Option<u16>,
+    #[serde(default)]
+    pub fee_bps_cosmic: Option<u16>,
+}
 
 #[cw_serde]
 pub struct InstantiateMsg {
@@ -88,9 +99,18 @@ pub enum ExecuteMsg {
         royalty_bps: u16,
     },
 
-    /// Update contract config (admin only)
+    /// Update contract config (admin only).
+    /// V1.6.0 introduces three explicit fee-tier fields. `fee_bps` is
+    /// retained for legacy storage compat but no longer used for the
+    /// effective fee calculation — `fee_bps_non_holder` replaces it.
     UpdateConfig {
         fee_bps: Option<u16>,
+        /// V1.6.0: fee bps when neither buyer NOR seller hold a Crystal.
+        fee_bps_non_holder: Option<u16>,
+        /// V1.6.0: fee bps when at least one side holds any non-Cosmic Crystal.
+        fee_bps_crystal: Option<u16>,
+        /// V1.6.0: fee bps when at least one side holds a Cosmic Crystal.
+        fee_bps_cosmic: Option<u16>,
         treasury_addr: Option<String>,
         capa_reward_addr: Option<String>,
         treasury_share_bps: Option<u16>,
@@ -296,6 +316,17 @@ pub enum QueryMsg {
     #[returns(FeeInfoResponse)]
     FeeInfo { buyer: Option<String> },
 
+    /// V1.6.0: dual-side fee preview. Surfaces what the trade would cost
+    /// given both sides — used by frontend on listing-detail pages where
+    /// both seller (from listing) and buyer (connected wallet) are known.
+    /// Either side can be omitted; if both omitted, returns the
+    /// non-holder baseline rate.
+    #[returns(FeeInfoForTradeResponse)]
+    FeeInfoForTrade {
+        buyer: Option<String>,
+        seller: Option<String>,
+    },
+
     /// Whether `nft_contract` is on the allowlist.
     #[returns(IsAllowedResponse)]
     IsCollectionAllowed { nft_contract: String },
@@ -360,19 +391,36 @@ pub struct RoyaltyInfoResponse {
 
 #[cw_serde]
 pub struct FeeInfoResponse {
-    /// Effective fee in bps after discount
+    /// Effective fee in bps after discount (legacy buyer-only path)
     pub fee_bps: u16,
     /// CAPA staked by buyer (0 if no buyer specified)
     pub capa_staked: Uint128,
-    /// Discount applied in bps
+    /// Discount applied in bps (vs non-holder baseline)
     pub discount_bps: u16,
     /// Whether buyer holds at least one CAPA Crystal of any tier.
     /// Kept for backwards compat — derived from `crystal_tier.is_some()`.
     pub crystal_holder: bool,
-    /// V1.1.0: highest Crystal tier owned by buyer. Drives the fee ladder:
-    /// cosmic→0bps, prismatic→25bps, radiant→50bps, charged→100bps,
-    /// raw→fee_bps (no discount), null→no Crystals owned.
+    /// Highest Crystal tier owned by buyer.
     pub crystal_tier: Option<String>,
+}
+
+/// V1.6.0: dual-side fee response. Tells the frontend exactly which
+/// tier applied + the full schedule so the UI can show "Cosmic discount
+/// applied via seller" or "Crystal discount applied via buyer" etc.
+#[cw_serde]
+pub struct FeeInfoForTradeResponse {
+    /// Effective fee in bps for THIS trade given both sides.
+    pub fee_bps: u16,
+    /// Which tier triggered the rate: "cosmic" / "crystal" / "non_holder".
+    pub applied_tier: String,
+    /// Buyer's highest Crystal tier (None = no Crystal / no buyer).
+    pub buyer_tier: Option<String>,
+    /// Seller's highest Crystal tier (None = no Crystal / no seller).
+    pub seller_tier: Option<String>,
+    /// Full schedule snapshot for UI (so frontend doesn't have to query Config).
+    pub fee_bps_non_holder: u16,
+    pub fee_bps_crystal: u16,
+    pub fee_bps_cosmic: u16,
 }
 
 #[cw_serde]
