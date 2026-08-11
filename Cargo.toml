@@ -1,6 +1,6 @@
 [package]
 name = "atrium-marketplace"
-version = "1.6.0-rc1"
+version = "1.6.1-rc1"
 edition = "2021"
 description = "Atrium NFT marketplace contract for Solid — adds vesting (TLA-Lock) listings + multi-address consumable-slot whitelists"
 

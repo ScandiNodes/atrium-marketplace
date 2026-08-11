@@ -23,7 +23,7 @@ use crate::state::{
     COLLECTION_OFFERS_BY_COLLECTION, CONFIG, CRYSTAL_NFT_CONTRACT, FEE_DISCOUNT_TIERS,
     LAUNCH_CAPS, LISTING_COUNT, LISTINGS, MAX_MERKLE_DEPTH, MAX_TIME_LOCK_BLOCKS,
     MAX_TRADES_PER_OFFER, MAX_WHITELIST_SLOTS,
-    OFFER_COUNT, OFFERS, OFFERS_BY_NFT, ROYALTIES, TRAIT_REGISTRY,
+    OFFER_COUNT, OFFERS, OFFERS_BY_NFT, PENDING_OWNER, ROYALTIES, TRAIT_REGISTRY,
 };
 
 const CONTRACT_NAME: &str = "crates.io:atrium-marketplace";
@@ -32,6 +32,9 @@ const MAX_LIMIT: u32 = 30;
 const DEFAULT_LIMIT: u32 = 10;
 const MAX_ROYALTY_BPS: u16 = 1500; // 15%
 const MAX_FEE_BPS: u16 = 500; // 5%
+// AUDIT (finding 1): treasury_share_bps is a fraction of the collected fee,
+// out of a fixed 10000 denominator (10000 = treasury takes the entire fee).
+const MAX_TREASURY_SHARE_BPS: u16 = 10000;
 
 // ═══════════════════════════════════════════
 // MIGRATE — V1.0 → V1.1 (tier ladder) → V1.2 (Cosmic-only)
@@ -53,18 +56,58 @@ const MAX_FEE_BPS: u16 = 500; // 5%
 //   • Up to 30 Crystals scanned per buyer to bound gas
 //   • FeeInfoResponse extended with `crystal_tier: Option<String>`
 //
-// No state changes in any migration — same Config, same Listings, same
-// Offers. migrate() only updates the cw2 contract version marker so
-// external indexers know which version is running. fee_bps is changed
-// separately via execute_update_config (NOT in migrate) to keep the
-// in-flight-listing-impact decision in operator hands.
+// AUDIT (finding 2): migrate now APPLIES the fields supplied in MigrateMsg
+// (previously the message was ignored and only the cw2 version bumped). Every
+// applied value is re-validated. The V1.6.0→V1.6.1 remediation migrate passes
+// treasury_share_bps = 6660 to move the stored 333 onto the fixed-10000 basis
+// (see finding 1) without a follow-up UpdateConfig tx.
+
+/// AUDIT (finding 1): the fee/treasury config invariant, enforced everywhere
+/// Config is written (instantiate, update_config, migrate). Each fee tier must
+/// be ≤ MAX_FEE_BPS; treasury_share_bps is a fraction of the collected fee out
+/// of 10000, so it must be ≤ 10000 (that guarantees treasury ≤ fee at
+/// settlement and `capa = fee − treasury` never underflows).
+fn validate_fee_config(config: &Config) -> Result<(), ContractError> {
+    for bps in [
+        config.fee_bps,
+        config.fee_bps_non_holder,
+        config.fee_bps_crystal,
+        config.fee_bps_cosmic,
+    ] {
+        if bps > MAX_FEE_BPS {
+            return Err(ContractError::FeeTooHigh { bps });
+        }
+    }
+    if config.treasury_share_bps > MAX_TREASURY_SHARE_BPS {
+        return Err(ContractError::TreasuryShareTooHigh {});
+    }
+    Ok(())
+}
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+
+    let mut config = CONFIG.load(deps.storage)?;
+    if let Some(v) = msg.fee_bps_non_holder {
+        config.fee_bps_non_holder = v;
+    }
+    if let Some(v) = msg.fee_bps_crystal {
+        config.fee_bps_crystal = v;
+    }
+    if let Some(v) = msg.fee_bps_cosmic {
+        config.fee_bps_cosmic = v;
+    }
+    if let Some(v) = msg.treasury_share_bps {
+        config.treasury_share_bps = v;
+    }
+    validate_fee_config(&config)?;
+    CONFIG.save(deps.storage, &config)?;
+
     Ok(Response::new()
         .add_attribute("action", "migrate")
-        .add_attribute("new_version", CONTRACT_VERSION))
+        .add_attribute("new_version", CONTRACT_VERSION)
+        .add_attribute("treasury_share_bps", config.treasury_share_bps.to_string()))
 }
 
 // ═══════════════════════════════════════════
@@ -80,15 +123,9 @@ pub fn instantiate(
 ) -> Result<Response, ContractError> {
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
-    if msg.fee_bps > MAX_FEE_BPS {
-        return Err(ContractError::FeeTooHigh { bps: msg.fee_bps });
-    }
-
-    // AUDIT FIX: treasury share cannot exceed total fee
-    if msg.treasury_share_bps > msg.fee_bps {
-        return Err(ContractError::TreasuryShareTooHigh {});
-    }
-
+    // AUDIT (finding 1): the fee/treasury invariant is enforced by
+    // validate_fee_config(&config) after construction below — same rules as
+    // update_config and migrate (fees ≤ MAX_FEE_BPS, treasury_share_bps ≤ 10000).
     let config = Config {
         owner: info.sender.clone(),
         fee_bps: msg.fee_bps,
@@ -109,6 +146,7 @@ pub fn instantiate(
         paused: false,
     };
 
+    validate_fee_config(&config)?;
     CONFIG.save(deps.storage, &config)?;
     LISTING_COUNT.save(deps.storage, &0u64)?;
     OFFER_COUNT.save(deps.storage, &0u64)?;
@@ -201,6 +239,7 @@ pub fn execute(
         ExecuteMsg::TransferOwnership { new_owner } => {
             execute_transfer_ownership(deps, info, new_owner)
         }
+        ExecuteMsg::AcceptOwnership {} => execute_accept_ownership(deps, info),
         ExecuteMsg::MakeCollectionOffer {
             nft_contract,
             price_per_nft,
@@ -346,6 +385,10 @@ fn execute_receive_nft(
         time_locked_until,
         locked_for: None,
         whitelist,
+        // AUDIT (royalty observation): freeze the collection's royalty terms
+        // as they stand right now, so the seller's proceeds can't be changed
+        // by a later admin SetRoyalty on this collection.
+        royalty: ROYALTIES.may_load(deps.storage, nft_contract.as_str())?,
     };
 
     LISTINGS.save(deps.storage, id, &listing)?;
@@ -707,24 +750,31 @@ fn execute_sale(
     // listing.seller is the address that gets debited; we pass it into
     // get_effective_fee so a Cosmic seller short-circuits to 0% even
     // when the buyer is a non-holder.
-    let effective_fee_bps =
-        get_effective_fee(deps.as_ref(), &config, buyer, Some(&listing.seller))?;
+    let (effective_fee_bps, _trade_tier) =
+        effective_fee_and_tier(deps.as_ref(), &config, Some(buyer), Some(&listing.seller))?;
     let fee_amount = sale_price.multiply_ratio(effective_fee_bps as u128, 10000u128);
-    let (treasury_amount, capa_amount) = if fee_amount.is_zero() || effective_fee_bps == 0 {
-        (Uint128::zero(), Uint128::zero())
-    } else {
-        // Split using the EFFECTIVE fee bps as denominator so the configured
-        // treasury_share_bps:capa_share ratio is preserved across all 3 tiers.
-        // (V1.5 used legacy config.fee_bps which broke the ratio after
-        // V1.6 introduced multiple tiers.)
-        let t = fee_amount
-            .multiply_ratio(config.treasury_share_bps as u128, effective_fee_bps as u128);
-        let c = fee_amount.checked_sub(t).unwrap_or(Uint128::zero());
-        (t, c)
-    };
+    // AUDIT (finding 1, SEVERE): split the COLLECTED fee between treasury and
+    // CAPA using a FIXED 10000 denominator. treasury_share_bps is a fraction
+    // of the fee, independent of the discount tier. The old code divided by
+    // the (discounted) effective fee bps, so on the Crystal/Cosmic tiers
+    // treasury_share_bps / effective_fee_bps > 1 and treasury was paid MORE
+    // than the whole fee — the excess came out of escrow held for other users
+    // (and the failed subtraction was masked with unwrap_or(zero)).
+    // treasury_share_bps is validated ≤ 10000 everywhere it is set, so
+    // treasury ≤ fee and `capa = fee − treasury` never underflows. When
+    // fee_amount is zero (Cosmic tier) both shares are naturally zero.
+    let treasury_amount =
+        fee_amount.multiply_ratio(config.treasury_share_bps as u128, 10000u128);
+    let capa_amount = fee_amount.checked_sub(treasury_amount)?;
 
-    // Calculate royalty
-    let royalty = ROYALTIES.may_load(deps.storage, listing.nft_contract.as_str())?;
+    // Calculate royalty. AUDIT (royalty observation): prefer the snapshot
+    // frozen into the listing at list-time, so a later admin SetRoyalty can't
+    // change the proceeds a seller committed to. Pre-snapshot listings (None)
+    // fall back to the current collection royalty for backwards compatibility.
+    let royalty = match listing.royalty.clone() {
+        Some(r) => Some(r),
+        None => ROYALTIES.may_load(deps.storage, listing.nft_contract.as_str())?,
+    };
     let royalty_amount = match &royalty {
         Some(r) => sale_price.multiply_ratio(r.royalty_bps as u128, 10000u128),
         None => Uint128::zero(),
@@ -739,6 +789,20 @@ fn execute_sale(
     let seller_amount = sale_price
         .checked_sub(fee_amount)?
         .checked_sub(royalty_amount)?;
+
+    // AUDIT (finding 1, SEVERE): before emitting ANY transfer, enforce that
+    // the four payouts sum EXACTLY to the price the buyer paid — the
+    // conservation invariant the escrow-draining bug violated. seller =
+    // price − fee − royalty and treasury + capa = fee, so this holds by
+    // construction; the check aborts the sale (rather than spending other
+    // users' escrow) if any future change breaks it.
+    let payouts = seller_amount + treasury_amount + capa_amount + royalty_amount;
+    if payouts != sale_price {
+        return Err(ContractError::SettlementImbalance {
+            payouts,
+            price: sale_price,
+        });
+    }
 
     // Build transfer messages
     let mut messages: Vec<CosmosMsg> = vec![];
@@ -1354,17 +1418,10 @@ fn execute_update_config(
         config.paused = p;
     }
 
-    // AUDIT FIX: Re-check invariant after partial update.
-    // Bound treasury_share_bps against the LARGEST possible effective fee
-    // (= highest of the 3 tiers + legacy fee_bps) so the share-split math
-    // never overruns regardless of which tier triggers.
-    let max_eff = config.fee_bps
-        .max(config.fee_bps_non_holder)
-        .max(config.fee_bps_crystal)
-        .max(config.fee_bps_cosmic);
-    if max_eff > 0 && config.treasury_share_bps > max_eff {
-        return Err(ContractError::TreasuryShareTooHigh {});
-    }
+    // AUDIT (finding 1): re-check the full config invariant after the partial
+    // update — treasury_share_bps ≤ 10000 (a fraction of the collected fee),
+    // every fee tier ≤ MAX_FEE_BPS.
+    validate_fee_config(&config)?;
 
     CONFIG.save(deps.storage, &config)?;
 
@@ -1448,18 +1505,39 @@ fn execute_transfer_ownership(
     info: MessageInfo,
     new_owner: String,
 ) -> Result<Response, ContractError> {
-    let mut config = CONFIG.load(deps.storage)?;
+    let config = CONFIG.load(deps.storage)?;
     if info.sender != config.owner {
         return Err(ContractError::NotAdmin {});
     }
+    // AUDIT (finding 5): step 1 — PROPOSE. The current owner keeps control
+    // until `new_owner` accepts, so control can't be handed to a mistyped or
+    // unreachable address. Re-proposing overwrites the pending owner; passing
+    // the current owner effectively cancels a pending transfer.
     let new_owner_addr = deps.api.addr_validate(&new_owner)?;
-    let old = config.owner.clone();
-    config.owner = new_owner_addr.clone();
-    CONFIG.save(deps.storage, &config)?;
+    PENDING_OWNER.save(deps.storage, &new_owner_addr)?;
     Ok(Response::new()
         .add_attribute("action", "transfer_ownership")
+        .add_attribute("current_owner", config.owner)
+        .add_attribute("pending_owner", new_owner_addr))
+}
+
+// AUDIT (finding 5): step 2 — the proposed owner ACCEPTS and becomes admin.
+fn execute_accept_ownership(deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
+    let pending = PENDING_OWNER
+        .may_load(deps.storage)?
+        .ok_or(ContractError::NoPendingOwner {})?;
+    if info.sender != pending {
+        return Err(ContractError::NotPendingOwner {});
+    }
+    let mut config = CONFIG.load(deps.storage)?;
+    let old = config.owner.clone();
+    config.owner = pending.clone();
+    CONFIG.save(deps.storage, &config)?;
+    PENDING_OWNER.remove(deps.storage);
+    Ok(Response::new()
+        .add_attribute("action", "accept_ownership")
         .add_attribute("old_owner", old)
-        .add_attribute("new_owner", new_owner_addr))
+        .add_attribute("new_owner", pending))
 }
 
 // ═══════════════════════════════════════════
@@ -1572,33 +1650,40 @@ fn decrement_offers_per_nft(
 /// V1.5 callers still using the single-buyer signature can pass
 /// seller=None; that path falls back to legacy buyer-only semantics
 /// (Cosmic discount on buyer only). Retained for FeeInfo backward compat.
-fn get_effective_fee(
+/// AUDIT (finding 3): resolve BOTH the effective fee bps AND the tier label
+/// that applied, from whichever side(s) are supplied. Symmetric best-of-two —
+/// Cosmic on either side → cosmic; any Crystal on either side → crystal;
+/// otherwise non_holder. Settlement passes both sides; the fee-preview query
+/// may pass either or neither (a seller-only preview now correctly applies the
+/// seller's tier instead of falling back to non_holder). Returning fee + tier
+/// together also halves the crystal-tier lookups settlement used to do.
+fn effective_fee_and_tier(
     deps: Deps,
     config: &Config,
-    buyer: &Addr,
+    buyer: Option<&Addr>,
     seller: Option<&Addr>,
-) -> StdResult<u16> {
+) -> StdResult<(u16, &'static str)> {
     // Resolve buyer first — most frequent fast-path is Cosmic buyer.
-    let buyer_tier = highest_crystal_tier(deps, buyer)?;
+    let buyer_tier = match buyer {
+        Some(b) => highest_crystal_tier(deps, b)?,
+        None => None,
+    };
     if matches!(buyer_tier.as_deref(), Some("cosmic")) {
-        return Ok(config.fee_bps_cosmic);
+        return Ok((config.fee_bps_cosmic, "cosmic"));
     }
 
-    // Resolve seller. If absent (FeeInfo query without seller), fall
-    // back to legacy buyer-only logic.
     let seller_tier = match seller {
         Some(s) => highest_crystal_tier(deps, s)?,
         None => None,
     };
     if matches!(seller_tier.as_deref(), Some("cosmic")) {
-        return Ok(config.fee_bps_cosmic);
+        return Ok((config.fee_bps_cosmic, "cosmic"));
     }
 
-    // Neither side is Cosmic. Crystal-tier discount if EITHER side holds
-    // any Crystal at all. (Tier identity beyond Cosmic doesn't matter for
-    // fee — Crystal is Crystal.)
+    // Neither side is Cosmic. Crystal-tier discount if EITHER side holds any
+    // Crystal at all. (Tier identity beyond Cosmic doesn't matter for fee.)
     if buyer_tier.is_some() || seller_tier.is_some() {
-        return Ok(config.fee_bps_crystal);
+        return Ok((config.fee_bps_crystal, "crystal"));
     }
 
     // CAPA-staker discount slot — placeholder for future integration.
@@ -1606,34 +1691,7 @@ fn get_effective_fee(
         // Future: query staked CAPA, walk FEE_DISCOUNT_TIERS
     }
 
-    Ok(config.fee_bps_non_holder)
-}
-
-/// Returns the effective tier label "name" for the trade — i.e. which
-/// of the 3 fee-tiers actually applied. Used in FeeInfoResponse + sale
-/// event attributes so frontend + indexers can show "Cosmic discount
-/// applied" badges without re-deriving the logic. Mirrors the same
-/// best-of-two priority as get_effective_fee.
-fn effective_trade_tier(
-    deps: Deps,
-    buyer: &Addr,
-    seller: Option<&Addr>,
-) -> StdResult<&'static str> {
-    let buyer_tier = highest_crystal_tier(deps, buyer)?;
-    if matches!(buyer_tier.as_deref(), Some("cosmic")) {
-        return Ok("cosmic");
-    }
-    let seller_tier = match seller {
-        Some(s) => highest_crystal_tier(deps, s)?,
-        None => None,
-    };
-    if matches!(seller_tier.as_deref(), Some("cosmic")) {
-        return Ok("cosmic");
-    }
-    if buyer_tier.is_some() || seller_tier.is_some() {
-        return Ok("crystal");
-    }
-    Ok("non_holder")
+    Ok((config.fee_bps_non_holder, "non_holder"))
 }
 
 // ─── Crystal tier resolution chain (mainnet phoenix-1, hardcoded) ──────────
@@ -1650,6 +1708,13 @@ const MINT_NFT_CONTRACT: &str    = "terra1jez9g0kqq7lze8ncqunvxzs9d2tu4m9p5vep3d
 /// the discount. cw721-base orders by token_id ascending, and Crystals
 /// 1..50 ARE the original Cosmics, so this is a low-prevalence corner.
 const TIER_QUERY_LIMIT: u32 = 30;
+
+/// AUDIT (finding 4): max pages of TIER_QUERY_LIMIT Crystals scanned per
+/// address before we stop (gas backstop). 20 × 30 = 600 tokens — far above
+/// the largest possible holding given the fixed Crystal supply, so in
+/// practice every holder is fully scanned; the bound only exists to keep
+/// worst-case gas finite.
+const MAX_TIER_PAGES: u32 = 20;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
 struct CrystalInfoQuery {
@@ -1676,35 +1741,51 @@ struct CrystalInfoResponse {
 /// fall through to fee_bps. Documented in integration_tests.rs.
 pub(crate) fn highest_crystal_tier(deps: Deps, buyer: &Addr) -> StdResult<Option<String>> {
     let crystal = CRYSTAL_NFT_CONTRACT.load(deps.storage)?;
-    let resp: TokensResponse = deps.querier.query_wasm_smart(
-        crystal,
-        &cw721::Cw721QueryMsg::Tokens {
-            owner: buyer.to_string(),
-            start_after: None,
-            limit: Some(TIER_QUERY_LIMIT),
-        },
-    )?;
-    if resp.tokens.is_empty() {
-        return Ok(None);
-    }
-
     let altar  = deps.api.addr_validate(ALTAR_NFT_CONTRACT)?;
     let fusion = deps.api.addr_validate(FUSION_NFT_CONTRACT)?;
     let mint   = deps.api.addr_validate(MINT_NFT_CONTRACT)?;
 
     let mut highest_rank: u8 = 0;
     let mut highest_name: Option<&str> = None;
+    let mut start_after: Option<String> = None;
 
-    for token_id in resp.tokens.iter() {
-        let tier = resolve_tier(deps, &altar, &fusion, &mint, token_id);
-        if let Some(t) = tier {
-            let r = tier_rank(&t);
-            if r > highest_rank {
-                highest_rank = r;
-                highest_name = tier_label(r);
-                if r == 5 { break; } // cosmic — short-circuit
+    // AUDIT (finding 4): paginate the owner's Crystals instead of only
+    // scanning the first TIER_QUERY_LIMIT. A holder with >30 Crystals whose
+    // Cosmic token sorts past the first page used to be over-charged the
+    // Crystal fee (Cosmic should be 0%). Walk pages until a Cosmic is found
+    // (short-circuit — it's the highest tier) or the wallet is exhausted,
+    // bounded by MAX_TIER_PAGES as a gas backstop (far above the largest
+    // realistic holding given the fixed Crystal supply).
+    for _ in 0..MAX_TIER_PAGES {
+        let resp: TokensResponse = deps.querier.query_wasm_smart(
+            crystal.clone(),
+            &cw721::Cw721QueryMsg::Tokens {
+                owner: buyer.to_string(),
+                start_after: start_after.clone(),
+                limit: Some(TIER_QUERY_LIMIT),
+            },
+        )?;
+        if resp.tokens.is_empty() {
+            break;
+        }
+        for token_id in resp.tokens.iter() {
+            if let Some(t) = resolve_tier(deps, &altar, &fusion, &mint, token_id) {
+                let r = tier_rank(&t);
+                if r > highest_rank {
+                    highest_rank = r;
+                    highest_name = tier_label(r);
+                    if r == 5 {
+                        // cosmic — highest possible tier, short-circuit.
+                        return Ok(highest_name.map(|s| s.to_string()));
+                    }
+                }
             }
         }
+        // A short page means we've reached the end of the wallet's tokens.
+        if (resp.tokens.len() as u32) < TIER_QUERY_LIMIT {
+            break;
+        }
+        start_after = resp.tokens.last().cloned();
     }
     Ok(highest_name.map(|s| s.to_string()))
 }
@@ -1795,9 +1876,8 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             let config = CONFIG.load(deps.storage)?;
             let (fee_bps, discount_bps, tier_opt) = if let Some(b) = buyer {
                 let addr = deps.api.addr_validate(&b)?;
-                // V1.6.0: legacy single-side query — passes seller=None,
-                // hits buyer-only fallback in get_effective_fee.
-                let eff = get_effective_fee(deps, &config, &addr, None)?;
+                // V1.6.0: legacy single-side query — passes seller=None.
+                let (eff, _tier) = effective_fee_and_tier(deps, &config, Some(&addr), None)?;
                 let t = highest_crystal_tier(deps, &addr).unwrap_or(None);
                 // discount = legacy non-holder rate minus effective rate
                 let baseline = config.fee_bps_non_holder.max(config.fee_bps);
@@ -1829,15 +1909,11 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
                 None => None,
             };
 
-            let (fee_bps, tier_label) = match (&buyer_addr, &seller_addr) {
-                (Some(b), s) => {
-                    let eff = get_effective_fee(deps, &config, b, s.as_ref())?;
-                    let lbl = effective_trade_tier(deps, b, s.as_ref())?;
-                    (eff, lbl)
-                }
-                // No buyer at all -> baseline non-holder rate.
-                (None, _) => (config.fee_bps_non_holder.max(config.fee_bps), "non_holder"),
-            };
+            // AUDIT (finding 3): resolve from whichever side(s) are supplied.
+            // A seller-only preview (buyer omitted) now applies the seller's
+            // tier instead of always returning the non-holder baseline.
+            let (fee_bps, tier_label) =
+                effective_fee_and_tier(deps, &config, buyer_addr.as_ref(), seller_addr.as_ref())?;
             let buyer_tier = match &buyer_addr {
                 Some(a) => highest_crystal_tier(deps, a).unwrap_or(None),
                 None => None,

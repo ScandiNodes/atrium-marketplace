@@ -12,20 +12,23 @@ use cw20::{Cw20Coin, Cw20ExecuteMsg, MinterResponse};
 use cw_multi_test::{App, AppBuilder, Contract, ContractWrapper, Executor};
 
 use crate::msg::{
-    CollectionOffersResponse, Cw20HookMsg, ExecuteMsg, FeeInfoForTradeResponse, FeeInfoResponse,
-    InstantiateMsg, IsAllowedResponse, ListNftMsg, MigrateMsg, QueryMsg, TraitProof,
-    TraitRegistryResponse,
+    Cw20HookMsg, ExecuteMsg, FeeInfoForTradeResponse, FeeInfoResponse, InstantiateMsg,
+    IsAllowedResponse, ListNftMsg, MigrateMsg, QueryMsg, TraitProof,
 };
-use crate::state::{CollectionOffer, LaunchCaps, PaymentType, TraitConstraint};
+use crate::state::{CollectionOffer, Config, LaunchCaps, PaymentType, TraitConstraint};
 
 // ─── Contract wrappers ─────────────────────────────────────────────────────
 
 fn marketplace_contract() -> Box<dyn Contract<Empty>> {
-    Box::new(ContractWrapper::new(
-        crate::contract::execute,
-        crate::contract::instantiate,
-        crate::contract::query,
-    ))
+    Box::new(
+        ContractWrapper::new(
+            crate::contract::execute,
+            crate::contract::instantiate,
+            crate::contract::query,
+        )
+        // AUDIT (finding 2): register migrate so tests can exercise it.
+        .with_migrate(crate::contract::migrate),
+    )
 }
 
 fn cw721_contract() -> Box<dyn Contract<Empty>> {
@@ -152,7 +155,10 @@ fn setup() -> Fixture {
         )
         .unwrap();
 
-    // Marketplace — fee_bps=150 (1.5%), treasury_share_bps=100 (=1.0%), capa_share=50 bps
+    // Marketplace — fee_bps=150 (1.5%). AUDIT (finding 1): treasury_share_bps
+    // is a fraction of the COLLECTED FEE out of 10000; 6667 ≈ 2/3, so of a
+    // 15_000 fee treasury gets 10_000 and the CAPA pool 5_000 (unchanged split,
+    // now computed correctly on every tier instead of only for non-holders).
     let market = app
         .instantiate_contract(
             market_id,
@@ -161,7 +167,7 @@ fn setup() -> Fixture {
                 fee_bps: 150,
                 treasury_addr: treasury.to_string(),
                 capa_reward_addr: capa_pool.to_string(),
-                treasury_share_bps: 100,
+                treasury_share_bps: 6667,
                 capa_gov_contract: None,
                 crystal_nft_contract: crystal.to_string(),
                 initial_collections: vec![crystal.to_string()],
@@ -172,7 +178,9 @@ fn setup() -> Fixture {
             },
             &[],
             "atrium",
-            None,
+            // AUDIT (finding 2): set a migrate admin so migrate() is testable
+            // (mirrors the deployed contract, which has a migrate admin key).
+            Some(owner.to_string()),
         )
         .unwrap();
 
@@ -332,7 +340,7 @@ fn invariant_01_instantiate_succeeds() {
         .query_wasm_smart(&fx.market, &QueryMsg::Config {})
         .unwrap();
     assert_eq!(cfg.fee_bps, 150);
-    assert_eq!(cfg.treasury_share_bps, 100);
+    assert_eq!(cfg.treasury_share_bps, 6667);
     assert!(!cfg.paused);
 }
 
@@ -385,7 +393,7 @@ fn invariant_02_instantiate_rejects_fee_above_5pct() {
 }
 
 #[test]
-fn invariant_03_instantiate_rejects_treasury_share_above_fee() {
+fn invariant_03_instantiate_rejects_treasury_share_over_10000() {
     let owner = Addr::unchecked("owner");
     let mut app = AppBuilder::new().build(|_, _, _| {});
     let market_id = app.store_code(marketplace_contract());
@@ -413,7 +421,10 @@ fn invariant_03_instantiate_rejects_treasury_share_above_fee() {
                 fee_bps: 100,
                 treasury_addr: "treasury".into(),
                 capa_reward_addr: "pool".into(),
-                treasury_share_bps: 200, // > fee
+                // AUDIT (finding 1): treasury_share_bps is a fraction of the
+                // collected fee out of 10000, so it may exceed the fee itself
+                // — the rejected case is now > 10000, not > fee.
+                treasury_share_bps: 10_001,
                 capa_gov_contract: None,
                 crystal_nft_contract: crystal.to_string(),
                 initial_collections: vec![],
@@ -529,7 +540,7 @@ fn invariant_08_buy_native_happy_path_with_correct_fee_split() {
 
     // Bob spent 1_000_000
     assert_eq!(bob_balance_before.u128() - bob_balance_after.u128(), 1_000_000);
-    // Fee = 1.5% of 1M = 15_000, split 100/150 to treasury (10_000) + 50/150 to pool (5_000)
+    // Fee = 1.5% of 1M = 15_000; treasury_share_bps=6667 → treasury 10_000, pool 5_000
     assert_eq!(treasury_after.u128() - treasury_before.u128(), 10_000);
     assert_eq!(pool_after.u128() - pool_before.u128(), 5_000);
     // Alice receives 985_000
@@ -678,8 +689,8 @@ fn invariant_13_crystal_holder_pays_full_fee_without_tier_resolution() {
     let alice_after = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
     let treasury_after = fx.app.wrap().query_balance(&fx.treasury, DENOM).unwrap().amount;
 
-    // Without tier resolution: full 1.5% fee applies. Treasury gets 1.0%
-    // (treasury_share_bps=100 of fee_bps=150), Alice gets the rest.
+    // Without tier resolution: full 1.5% fee applies. Treasury gets 66.6% of
+    // the 15_000 fee (treasury_share_bps=6667) = 10_000, Alice gets the rest.
     assert_eq!(treasury_after.u128() - treasury_before.u128(), 10_000);
     assert_eq!(alice_after.u128() - alice_before.u128(), 985_000);
 }
@@ -1253,8 +1264,12 @@ fn invariant_28_zero_price_listing_rejected() {
 }
 
 #[test]
-fn invariant_29_transfer_ownership_works() {
+fn invariant_29_transfer_ownership_is_two_step() {
+    // AUDIT (finding 5): ownership transfer is propose + accept. Proposing
+    // alone does NOT hand over control — the proposed owner must accept.
     let mut fx = setup();
+
+    // Step 1: propose. Ownership does not change yet.
     fx.app
         .execute_contract(
             fx.owner.clone(),
@@ -1266,11 +1281,11 @@ fn invariant_29_transfer_ownership_works() {
         )
         .unwrap();
 
-    // Old owner can no longer admin
+    // The proposed owner cannot admin until they accept.
     let err = fx
         .app
         .execute_contract(
-            fx.owner.clone(),
+            Addr::unchecked("new_owner"),
             fx.market.clone(),
             &ExecuteMsg::AddCollection {
                 nft_contract: fx.other_collection.to_string(),
@@ -1280,12 +1295,59 @@ fn invariant_29_transfer_ownership_works() {
         .unwrap_err();
     assert_err(&err, "not the contract admin");
 
-    // New owner can
+    // A stranger cannot accept the pending transfer.
+    let err = fx
+        .app
+        .execute_contract(
+            Addr::unchecked("stranger"),
+            fx.market.clone(),
+            &ExecuteMsg::AcceptOwnership {},
+            &[],
+        )
+        .unwrap_err();
+    assert_err(&err, "pending owner");
+
+    // The old owner still controls the contract until acceptance.
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::AddCollection {
+                nft_contract: fx.other_collection.to_string(),
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Step 2: the proposed owner accepts → becomes admin.
     fx.app
         .execute_contract(
             Addr::unchecked("new_owner"),
             fx.market.clone(),
-            &ExecuteMsg::AddCollection {
+            &ExecuteMsg::AcceptOwnership {},
+            &[],
+        )
+        .unwrap();
+
+    // Old owner can no longer admin; new owner can.
+    let err = fx
+        .app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::RemoveCollection {
+                nft_contract: fx.other_collection.to_string(),
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert_err(&err, "not the contract admin");
+
+    fx.app
+        .execute_contract(
+            Addr::unchecked("new_owner"),
+            fx.market.clone(),
+            &ExecuteMsg::RemoveCollection {
                 nft_contract: fx.other_collection.to_string(),
             },
             &[],
@@ -2510,7 +2572,7 @@ fn v16_settle_sale_uses_non_holder_rate_in_test_env() {
                 fee_bps_cosmic: Some(0),
                 treasury_addr: None,
                 capa_reward_addr: None,
-                treasury_share_bps: Some(333), // 2/3 to treasury
+                treasury_share_bps: Some(6660), // AUDIT (finding 1): 66.6% of fee (was 333/500)
                 capa_gov_contract: None,
                 paused: None,
             },
@@ -2570,7 +2632,224 @@ fn v16_settle_sale_uses_non_holder_rate_in_test_env() {
 
     // 5% fee on 1_000_000 = 50_000. Alice receives 950_000.
     assert_eq!(alice_after - alice_before, Uint128::new(950_000));
-    // Treasury share = 333/500 of 50_000 = 33_300. CAPA pool = 16_700.
+    // AUDIT (finding 1): treasury share = 6660/10000 of the 50_000 fee =
+    // 33_300, CAPA pool = 16_700 (same split, now correct on every tier).
     assert_eq!(treasury_after - treasury_before, Uint128::new(33_300));
     assert_eq!(capa_pool_after - capa_pool_before, Uint128::new(16_700));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUDIT REMEDIATION — SCV report 2026-08-08, regression tests per finding
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// AUDIT (finding 1, SEVERE): treasury is a FIXED fraction of the collected
+/// fee (out of 10000), independent of the discount tier. A treasury share
+/// GREATER than the fee bps is now valid (66.6% here) and still never pays out
+/// more than the fee — so a discounted sale can no longer spend escrow held
+/// for other users. Verifies the split, the conservation invariant, and that
+/// an unrelated offer's escrow is left completely untouched.
+#[test]
+fn audit_finding1_treasury_split_is_fraction_of_fee_no_escrow_drain() {
+    let mut fx = setup();
+
+    // Production config: 5% non-holder fee, treasury takes 66.6% of every fee.
+    // treasury_share_bps=6660 exceeds the 500 fee bps — impossible to set under
+    // the old validation, which bounded it against the fee; the fix bounds it
+    // against 10000.
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::UpdateConfig {
+                fee_bps: None,
+                fee_bps_non_holder: Some(500),
+                fee_bps_crystal: Some(150),
+                fee_bps_cosmic: Some(0),
+                treasury_addr: None,
+                capa_reward_addr: None,
+                treasury_share_bps: Some(6660),
+                capa_gov_contract: None,
+                paused: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Alice lists a token; a THIRD party (carol) parks 40_000 of escrow in
+    // the contract via an offer on it. This is the "funds held for other
+    // users" the drain bug spent.
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+    fx.app
+        .execute_contract(
+            Addr::unchecked("carol"),
+            fx.market.clone(),
+            &ExecuteMsg::MakeOffer {
+                nft_contract: fx.crystal.to_string(),
+                token_id: "1".into(),
+                expires_in_blocks: 0,
+            },
+            &coins(40_000, DENOM),
+        )
+        .unwrap();
+    let market_escrow_before = fx.app.wrap().query_balance(&fx.market, DENOM).unwrap().amount;
+
+    let alice_before = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+    let treasury_before = fx.app.wrap().query_balance(&fx.treasury, DENOM).unwrap().amount;
+    let pool_before = fx.app.wrap().query_balance(&fx.capa_pool, DENOM).unwrap().amount;
+
+    // Bob buys directly for 1_000_000 (does not touch carol's offer).
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap();
+
+    let alice_after = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+    let treasury_after = fx.app.wrap().query_balance(&fx.treasury, DENOM).unwrap().amount;
+    let pool_after = fx.app.wrap().query_balance(&fx.capa_pool, DENOM).unwrap().amount;
+
+    // Fee = 5% of 1M = 50_000. Treasury = 66.6% = 33_300, CAPA = 16_700,
+    // seller = 950_000. Payouts sum EXACTLY to the price the buyer paid.
+    let treasury_paid = (treasury_after - treasury_before).u128();
+    let pool_paid = (pool_after - pool_before).u128();
+    let seller_paid = (alice_after - alice_before).u128();
+    assert_eq!(treasury_paid, 33_300);
+    assert_eq!(pool_paid, 16_700);
+    assert_eq!(seller_paid, 950_000);
+    assert_eq!(seller_paid + treasury_paid + pool_paid, 1_000_000);
+    // Treasury never exceeds the collected fee.
+    assert!(treasury_paid <= 50_000);
+    // Charlie's 40_000 escrow is completely untouched by the sale.
+    let market_escrow_after = fx.app.wrap().query_balance(&fx.market, DENOM).unwrap().amount;
+    assert_eq!(market_escrow_after, market_escrow_before);
+}
+
+/// AUDIT (finding 2): migrate APPLIES the supplied fee/treasury fields
+/// (previously the message was ignored). `None` leaves a field unchanged.
+#[test]
+fn audit_finding2_migrate_applies_fee_config() {
+    let mut fx = setup();
+    let new_code = fx.app.store_code(marketplace_contract());
+
+    fx.app
+        .migrate_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &MigrateMsg {
+                fee_bps_non_holder: Some(300),
+                fee_bps_crystal: Some(120),
+                fee_bps_cosmic: Some(10),
+                treasury_share_bps: Some(6660),
+            },
+            new_code,
+        )
+        .unwrap();
+
+    let cfg: Config = fx
+        .app
+        .wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(cfg.fee_bps_non_holder, 300);
+    assert_eq!(cfg.fee_bps_crystal, 120);
+    assert_eq!(cfg.fee_bps_cosmic, 10);
+    assert_eq!(cfg.treasury_share_bps, 6660);
+
+    // A second migrate with all-None leaves everything unchanged.
+    let newer_code = fx.app.store_code(marketplace_contract());
+    fx.app
+        .migrate_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &MigrateMsg::default(),
+            newer_code,
+        )
+        .unwrap();
+    let cfg2: Config = fx
+        .app
+        .wrap()
+        .query_wasm_smart(&fx.market, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(cfg2.fee_bps_non_holder, 300);
+    assert_eq!(cfg2.treasury_share_bps, 6660);
+
+    // An out-of-range treasury share is rejected at migrate-time.
+    let bad_code = fx.app.store_code(marketplace_contract());
+    let err = fx
+        .app
+        .migrate_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &MigrateMsg {
+                fee_bps_non_holder: None,
+                fee_bps_crystal: None,
+                fee_bps_cosmic: None,
+                treasury_share_bps: Some(10_001),
+            },
+            bad_code,
+        )
+        .unwrap_err();
+    assert_err(&err, "treasury_share_bps");
+}
+
+/// AUDIT (royalty observation): royalty terms are snapshotted at list-time, so
+/// a later admin SetRoyalty cannot change the proceeds a seller committed to.
+#[test]
+fn audit_royalty_snapshot_frozen_at_list_time() {
+    let mut fx = setup();
+
+    // Collection royalty is 5% at list-time.
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::SetRoyalty {
+                nft_contract: fx.crystal.to_string(),
+                recipient: "artist".into(),
+                royalty_bps: 500,
+            },
+            &[],
+        )
+        .unwrap();
+
+    mint_crystal(&mut fx, "alice", "1");
+    list_nft_native(&mut fx, "alice", Coll::Crystal, "1", 1_000_000, 0).unwrap();
+
+    // Admin RAISES royalty to 15% AFTER the listing was created.
+    fx.app
+        .execute_contract(
+            fx.owner.clone(),
+            fx.market.clone(),
+            &ExecuteMsg::SetRoyalty {
+                nft_contract: fx.crystal.to_string(),
+                recipient: "artist".into(),
+                royalty_bps: 1500,
+            },
+            &[],
+        )
+        .unwrap();
+
+    let artist_before = fx.app.wrap().query_balance("artist", DENOM).unwrap().amount;
+    let alice_before = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+
+    fx.app
+        .execute_contract(
+            Addr::unchecked("bob"),
+            fx.market.clone(),
+            &ExecuteMsg::BuyNft { listing_id: 1 },
+            &coins(1_000_000, DENOM),
+        )
+        .unwrap();
+
+    let artist_after = fx.app.wrap().query_balance("artist", DENOM).unwrap().amount;
+    let alice_after = fx.app.wrap().query_balance("alice", DENOM).unwrap().amount;
+
+    // The FROZEN 5% royalty applies (50_000), NOT the raised 15% (150_000).
+    assert_eq!((artist_after - artist_before).u128(), 50_000);
+    // Seller = price − fee(1.5% = 15_000) − royalty(50_000) = 935_000.
+    assert_eq!((alice_after - alice_before).u128(), 935_000);
 }
