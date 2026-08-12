@@ -1,7 +1,7 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::Uint128;
 use crate::state::{
-    CollectionOffer, Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
+    CollectionOffer, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
     TraitConstraint, TraitRegistry,
 };
 
@@ -289,7 +289,7 @@ pub enum Cw20HookMsg {
 #[cw_serde]
 #[derive(QueryResponses)]
 pub enum QueryMsg {
-    #[returns(Config)]
+    #[returns(crate::state::Config)]
     Config {},
 
     #[returns(Listing)]
