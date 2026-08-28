@@ -1,7 +1,7 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::Uint128;
 use crate::state::{
-    CollectionOffer, Config, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
+    CollectionOffer, LaunchCaps, Listing, Offer, PaymentType, RoyaltyInfo,
     TraitConstraint, TraitRegistry,
 };
 
@@ -9,20 +9,27 @@ use crate::state::{
 // INSTANTIATE
 // ═══════════════════════════════════════════
 
-// V1.1.0 migration takes no parameters — the contract just bumps its
-// cw2 version marker and starts using the new tier-ladder fee logic.
+/// Migration parameters. AUDIT (finding 2): every `Some` field below is
+/// APPLIED to Config during migrate (previously the message was ignored and
+/// only the cw2 version bumped). `None` leaves the stored value untouched —
+/// there is no silent default backfill, so a migrate that changes nothing is
+/// `MigrateMsg::default()`. All applied values are re-validated.
 #[cw_serde]
+#[derive(Default)]
 pub struct MigrateMsg {
-    /// V1.6.0: optional explicit defaults at migrate-time. When None,
-    /// the migrate fn backfills with safe defaults (5% / 1.5% / 0%).
-    /// Set explicitly to override at migrate-time without a follow-up
-    /// UpdateConfig tx.
+    /// Fee bps when neither buyer NOR seller hold a Crystal. `None` = keep.
     #[serde(default)]
     pub fee_bps_non_holder: Option<u16>,
     #[serde(default)]
     pub fee_bps_crystal: Option<u16>,
     #[serde(default)]
     pub fee_bps_cosmic: Option<u16>,
+    /// AUDIT (finding 1): treasury's share of the collected fee, in bps out
+    /// of 10000 (fixed denominator). The V1.6.0→V1.6.1 migrate sets this to
+    /// 6660 to preserve the intended 66.6% treasury / 33.4% CAPA split that
+    /// the old effective-fee-denominator math only produced for non-holders.
+    #[serde(default)]
+    pub treasury_share_bps: Option<u16>,
 }
 
 #[cw_serde]
@@ -33,8 +40,10 @@ pub struct InstantiateMsg {
     pub treasury_addr: String,
     /// CAPA staking reward pool address
     pub capa_reward_addr: String,
-    /// How much of the fee goes to treasury (bps out of fee_bps)
-    /// e.g. 100 means treasury gets 100 bps (1.0%) and CAPA pool gets remainder
+    /// How much of the COLLECTED FEE goes to treasury, in bps out of 10000
+    /// (the CAPA pool gets the remainder). AUDIT (finding 1): this is a fixed
+    /// fraction of the fee, independent of which discount tier applied — e.g.
+    /// 6660 = treasury gets 66.6% of every fee, CAPA gets 33.4%.
     pub treasury_share_bps: u16,
     /// Optional: CAPA governance staking contract for fee discounts
     pub capa_gov_contract: Option<String>,
@@ -132,8 +141,15 @@ pub enum ExecuteMsg {
     /// Update the launch caps (admin can relax once we're confident).
     UpdateLaunchCaps { caps: LaunchCaps },
 
-    /// Transfer admin ownership.
+    /// AUDIT (finding 5): step 1 of a two-step ownership transfer — PROPOSE
+    /// `new_owner` as the pending owner. Admin keeps control until the
+    /// proposed owner accepts. Calling again overwrites the pending owner;
+    /// pass the current owner to effectively cancel.
     TransferOwnership { new_owner: String },
+
+    /// AUDIT (finding 5): step 2 — the pending owner ACCEPTS and becomes the
+    /// admin. Guards against handing control to a mistyped/unreachable address.
+    AcceptOwnership {},
 
     // ─── V1.3.0: Collection offers ──────────────────────────────────────
 
@@ -273,7 +289,7 @@ pub enum Cw20HookMsg {
 #[cw_serde]
 #[derive(QueryResponses)]
 pub enum QueryMsg {
-    #[returns(Config)]
+    #[returns(crate::state::Config)]
     Config {},
 
     #[returns(Listing)]

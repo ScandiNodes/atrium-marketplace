@@ -122,6 +122,15 @@ pub struct Listing {
     /// Hard-capped by `MAX_WHITELIST_SLOTS` to bound storage + gas.
     #[serde(default)]
     pub whitelist: Option<Vec<WhitelistSlot>>,
+
+    /// AUDIT (royalty observation): royalty terms SNAPSHOT at list-time.
+    /// The collection royalty is read from `ROYALTIES` when the listing is
+    /// created and frozen here, so a later admin `SetRoyalty` can never
+    /// change the proceeds a seller committed to. Settlement prefers this
+    /// snapshot; `None` (pre-migration listings) falls back to the current
+    /// `ROYALTIES` value for backwards compatibility.
+    #[serde(default)]
+    pub royalty: Option<RoyaltyInfo>,
 }
 
 /// V1.5.0: One entry in a Listing's promo whitelist.
@@ -254,6 +263,12 @@ pub struct RoyaltyInfo {
 // ═══════════════════════════════════════════
 
 pub const CONFIG: Item<Config> = Item::new("config");
+
+/// AUDIT (finding 5): pending owner for two-step ownership transfer.
+/// `TransferOwnership` proposes (writes here); `AcceptOwnership` (called by
+/// the proposed owner) promotes it into `Config.owner` and clears this.
+/// Empty = no transfer in flight.
+pub const PENDING_OWNER: Item<Addr> = Item::new("pending_owner");
 
 // Auto-incrementing counters
 pub const LISTING_COUNT: Item<u64> = Item::new("lc");

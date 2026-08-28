@@ -1,4 +1,4 @@
-use cosmwasm_std::{OverflowError, StdError};
+use cosmwasm_std::{OverflowError, StdError, Uint128};
 use thiserror::Error;
 
 /// Atrium marketplace errors.
@@ -86,13 +86,29 @@ pub enum ContractError {
     #[error("This NFT has reached its active-offer cap ({cap}) — wait for one to settle or expire")]
     OfferCapExceeded { cap: u32 },
 
-    /// Treasury share misconfigured at instantiate.
-    #[error("treasury_share_bps cannot exceed fee_bps")]
+    /// Treasury share misconfigured. AUDIT (finding 1): the share is a
+    /// fraction of the collected fee out of 10000, so it must not exceed 10000.
+    #[error("treasury_share_bps cannot exceed 10000 (it is a fraction of the collected fee)")]
     TreasuryShareTooHigh {},
 
     /// Royalty + fee combined exceed the sale price (would underflow seller payout).
     #[error("Fee + royalty exceeds sale price — refusing to settle a negative payout")]
     FeeExceedsPrice {},
+
+    /// AUDIT (finding 1): settlement outputs must sum EXACTLY to the buyer
+    /// payment. Refuse to emit any transfer if seller + treasury + CAPA +
+    /// royalty ≠ price — never spend escrow held for other users.
+    #[error("Settlement imbalance: payouts ({payouts}) must equal price paid ({price})")]
+    SettlementImbalance { payouts: Uint128, price: Uint128 },
+
+    /// AUDIT (finding 5): AcceptOwnership called with no transfer in flight.
+    #[error("No ownership transfer is pending")]
+    NoPendingOwner {},
+
+    /// AUDIT (finding 5): AcceptOwnership called by someone other than the
+    /// proposed owner.
+    #[error("Caller is not the pending owner")]
+    NotPendingOwner {},
 
     /// Multi-coin send to a single-denom entrypoint.
     #[error("Send exactly one coin denomination — multi-denom sends would lock the surplus")]
